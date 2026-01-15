@@ -1,10 +1,16 @@
 """
-DIGIL SSH Checker - Main GUI Application
-========================================
-Tool per verificare la raggiungibilità SSH dei dispositivi DIGIL
+DIGIL Diagnostic Checker - Main GUI Application
+================================================
+Tool per verifica connettività e diagnostica avanzata dispositivi DIGIL
 con interfaccia grafica professionale in stile Terna.
 
-Versione: 1.0.0
+Versione: 2.0.0
+
+Features:
+- Check SSH/Ping (via macchina ponte)
+- API Diagnostica (batteria, LTE, porta aperta)
+- MongoDB 24h (verifica invio dati)
+- Classificazione automatica malfunzionamenti
 """
 
 import sys
@@ -19,14 +25,14 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QProgressBar,
     QComboBox, QSpinBox, QGroupBox, QFileDialog, QMessageBox,
     QHeaderView, QAbstractItemView, QStatusBar, QFrame, QSplitter,
-    QTextEdit, QCheckBox, QTabWidget
+    QTextEdit, QCheckBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt5.QtGui import QIcon, QPixmap, QFont, QColor, QPalette, QBrush
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QIcon, QPixmap, QColor
 
 from connectivity_checker import (
     DeviceInfo, ConnectionStatus, DeviceType, Vendor,
-    MultiThreadChecker
+    MultiThreadChecker, BridgeConnection
 )
 from data_handler import DataLoader, ResultExporter, update_monitoring_file
 
@@ -127,6 +133,16 @@ QPushButton#secondaryButton:hover {
     background-color: #E6F2FF;
 }
 
+QPushButton#clearButton {
+    background-color: #CC3300;
+    min-width: 30px;
+    padding: 8px;
+}
+
+QPushButton#clearButton:hover {
+    background-color: #992600;
+}
+
 /* Tabella */
 QTableWidget {
     border: 1px solid #CCCCCC;
@@ -189,11 +205,6 @@ QComboBox::drop-down {
     width: 30px;
 }
 
-QComboBox::down-arrow {
-    width: 12px;
-    height: 12px;
-}
-
 /* SpinBox */
 QSpinBox {
     border: 1px solid #CCCCCC;
@@ -228,29 +239,6 @@ QFrame#separator {
     max-height: 1px;
 }
 
-/* Tab Widget */
-QTabWidget::pane {
-    border: 1px solid #CCCCCC;
-    border-radius: 4px;
-    background-color: white;
-}
-
-QTabBar::tab {
-    background-color: #F0F0F0;
-    border: 1px solid #CCCCCC;
-    padding: 8px 16px;
-    margin-right: 2px;
-}
-
-QTabBar::tab:selected {
-    background-color: #0066CC;
-    color: white;
-}
-
-QTabBar::tab:hover:!selected {
-    background-color: #E6F2FF;
-}
-
 /* CheckBox */
 QCheckBox {
     spacing: 8px;
@@ -275,44 +263,191 @@ QCheckBox::indicator:checked {
 """
 
 
-class WorkerThread(QThread):
-    """Thread worker per eseguire i test senza bloccare la GUI"""
+class DiagnosticWorkerThread(QThread):
+    """Thread worker per eseguire i test diagnostici completi"""
     
     progress_signal = pyqtSignal(object, str, int, int)  # device, message, current, total
     completed_signal = pyqtSignal(list)  # results
     error_signal = pyqtSignal(str)  # error message
     bridge_status_signal = pyqtSignal(object, str)  # connected (bool/None), message
+    phase_signal = pyqtSignal(str)  # current phase description
     
-    def __init__(self, devices: list[DeviceInfo], max_workers: int = 10):
+    def __init__(self, devices: list, max_workers: int = 10,
+                 check_ssh: bool = True, check_api: bool = True, check_mongodb: bool = True):
         super().__init__()
         self.devices = devices
         self.max_workers = max_workers
+        self.check_ssh = check_ssh
+        self.check_api = check_api
+        self.check_mongodb = check_mongodb
         self.checker: Optional[MultiThreadChecker] = None
         self._stop_requested = False
         
     def run(self):
         try:
-            self.checker = MultiThreadChecker(max_workers=self.max_workers)
+            # Fase 1: SSH/Ping
+            if self.check_ssh:
+                self.phase_signal.emit("Fase 1/3: Check SSH/Ping...")
+                self.checker = MultiThreadChecker(max_workers=self.max_workers)
+                
+                def on_progress(device, message, current, total):
+                    self.progress_signal.emit(device, message, current, total)
+                
+                def on_bridge_status(connected, message):
+                    self.bridge_status_signal.emit(connected, message)
+                
+                results = self.checker.check_devices(
+                    self.devices,
+                    progress_callback=on_progress,
+                    bridge_callback=on_bridge_status
+                )
+            else:
+                results = self.devices
             
-            def on_progress(device, message, current, total):
-                self.progress_signal.emit(device, message, current, total)
+            # Fase 2: API Diagnostica
+            if self.check_api and not self._stop_requested:
+                self.phase_signal.emit("Fase 2/3: API Diagnostica...")
+                self._run_api_checks(results)
             
-            def on_complete(results):
-                self.completed_signal.emit(results)
+            # Fase 3: MongoDB
+            if self.check_mongodb and not self._stop_requested:
+                self.phase_signal.emit("Fase 3/3: Check MongoDB 24h...")
+                self._run_mongodb_checks(results)
             
-            def on_bridge_status(connected, message):
-                self.bridge_status_signal.emit(connected, message)
+            # Classificazione finale
+            if not self._stop_requested:
+                self.phase_signal.emit("Classificazione malfunzionamenti...")
+                self._classify_malfunctions(results)
             
-            # Esegue i test
-            self.checker.check_devices(
-                self.devices,
-                progress_callback=on_progress,
-                completion_callback=on_complete,
-                bridge_callback=on_bridge_status
-            )
+            self.completed_signal.emit(results)
             
         except Exception as e:
             self.error_signal.emit(str(e))
+    
+    def _run_api_checks(self, devices: list):
+        """Esegue i check API per ogni dispositivo"""
+        try:
+            from api_client import DigilAPIClient
+            api_client = DigilAPIClient()
+            
+            for i, device in enumerate(devices):
+                if self._stop_requested:
+                    break
+                    
+                self.progress_signal.emit(device, f"API check {i+1}/{len(devices)}...", i, len(devices))
+                
+                try:
+                    api_result = api_client.get_device_diagnostics(device.device_id)
+                    if api_result:
+                        device.api_data = api_result
+                        device.battery_ok = api_result.get('battery_ok', None)
+                        device.door_open = api_result.get('door_open', None)
+                        device.lte_ok = api_result.get('lte_ok', None)
+                        device.soc_percent = api_result.get('soc_percent', None)
+                        device.soh_percent = api_result.get('soh_percent', None)
+                        device.lte_signal_dbm = api_result.get('lte_signal_dbm', None)
+                        device.channel = api_result.get('channel', None)
+                except Exception as e:
+                    device.api_error = str(e)[:100]
+                    
+        except ImportError:
+            # api_client non disponibile
+            for device in devices:
+                device.api_error = "api_client module not available"
+    
+    def _run_mongodb_checks(self, devices: list):
+        """Esegue i check MongoDB per ogni dispositivo tramite SSH tunnel."""
+        try:
+            from mongodb_checker import MongoDBChecker, get_tunnel_manager, cleanup_tunnel
+            
+            # Usa il tunnel manager singleton
+            tunnel_manager = get_tunnel_manager()
+            
+            # Avvia il tunnel SSH (una sola volta per tutti i device)
+            self.phase_signal.emit("Fase 3/3: Avvio tunnel SSH verso MongoDB...")
+            success, msg, port = tunnel_manager.start_tunnel()
+            
+            if not success:
+                for device in devices:
+                    device.mongodb_error = f"Tunnel SSH fallito: {msg}"
+                return
+            
+            # Connetti a MongoDB attraverso il tunnel
+            mongo_checker = MongoDBChecker(tunnel_manager)
+            success, msg = mongo_checker.connect()
+            
+            if not success:
+                for device in devices:
+                    device.mongodb_error = f"Connessione MongoDB fallita: {msg}"
+                return
+            
+            self.phase_signal.emit("Fase 3/3: Check MongoDB 24h in corso...")
+            
+            for i, device in enumerate(devices):
+                if self._stop_requested:
+                    break
+                    
+                self.progress_signal.emit(device, f"MongoDB check {i+1}/{len(devices)}...", i, len(devices))
+                
+                try:
+                    mongo_result = mongo_checker.check_device(device.device_id)
+                    device.mongodb_has_data = mongo_result.has_data_24h
+                    device.mongodb_last_timestamp = mongo_result.last_timestamp
+                    device.mongodb_checked = mongo_result.checked
+                    if mongo_result.error:
+                        device.mongodb_error = mongo_result.error
+                except Exception as e:
+                    device.mongodb_error = str(e)[:100]
+            
+            # Chiudi connessione MongoDB (ma mantieni tunnel per eventuali altri usi)
+            mongo_checker.disconnect()
+                    
+        except ImportError as e:
+            for device in devices:
+                device.mongodb_error = f"Modulo non disponibile: {str(e)}"
+    
+    def _classify_malfunctions(self, devices: list):
+        """Classifica i malfunzionamenti per ogni dispositivo"""
+        try:
+            from malfunction_classifier import MalfunctionClassifier
+            classifier = MalfunctionClassifier()
+            
+            for device in devices:
+                device.malfunction_type = classifier.classify(device)
+        except ImportError:
+            # Classificazione semplificata se il modulo non è disponibile
+            for device in devices:
+                device.malfunction_type = self._simple_classify(device)
+    
+    def _simple_classify(self, device) -> str:
+        """Classificazione semplificata di fallback"""
+        # SSH KO
+        ssh_ok = device.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(device, 'ssh_status') else None
+        ping_ok = device.ping_status == ConnectionStatus.PING_OK if hasattr(device, 'ping_status') else None
+        
+        # API data
+        battery_ok = getattr(device, 'battery_ok', None)
+        door_open = getattr(device, 'door_open', None)
+        lte_ok = getattr(device, 'lte_ok', None)
+        
+        # MongoDB
+        mongodb_ok = getattr(device, 'mongodb_has_data', None)
+        
+        # Logica di classificazione
+        if door_open == True:
+            return "Porta aperta"
+        if battery_ok == False:
+            return "Allarme batteria"
+        if not ssh_ok and not ping_ok:
+            return "Disconnesso"
+        if mongodb_ok == False and (ssh_ok or lte_ok):
+            return "Metriche assenti"
+        if ssh_ok and lte_ok and mongodb_ok:
+            return "OK"
+        if not lte_ok:
+            return "Disconnesso"
+        
+        return "Non classificato"
     
     def stop(self):
         self._stop_requested = True
@@ -328,8 +463,8 @@ class MainWindow(QMainWindow):
         
         self.data_loader = DataLoader()
         self.result_exporter = ResultExporter()
-        self.worker_thread: Optional[WorkerThread] = None
-        self.results: list[DeviceInfo] = []
+        self.worker_thread: Optional[DiagnosticWorkerThread] = None
+        self.results: list = []
         
         self.init_ui()
         self.apply_style()
@@ -338,33 +473,42 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(100, self.auto_load_file)
         
         # Carica il logo Terna se presente
-        self.auto_load_logo()
+        QTimer.singleShot(50, self.auto_load_logo)
     
     def auto_load_logo(self):
-        """Cerca e carica automaticamente il logo Terna"""
+        """Cerca e carica automaticamente il logo Terna dalla cartella assets"""
         # Possibili percorsi del logo
+        script_dir = Path(__file__).parent
         possible_paths = [
-            Path(__file__).parent / "assets" / "logo_terna.png",
-            Path(__file__).parent / "assets" / "logo.png",
-            Path(__file__).parent / "logo_terna.png",
-            Path(__file__).parent / "logo.png",
+            script_dir / "assets" / "logo_terna.png",
+            script_dir / "assets" / "logo.png",
+            script_dir / "assets" / "terna_logo.png",
+            script_dir / "logo_terna.png",
+            script_dir / "logo.png",
             Path.cwd() / "assets" / "logo_terna.png",
             Path.cwd() / "assets" / "logo.png",
         ]
         
         for logo_path in possible_paths:
             if logo_path.exists():
-                self.load_logo(str(logo_path))
-                self.log(f"Logo caricato: {logo_path.name}", "INFO")
-                return
+                try:
+                    pixmap = QPixmap(str(logo_path))
+                    if not pixmap.isNull():
+                        self.logo_label.setPixmap(pixmap.scaled(120, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                        self.logo_label.setText("")
+                        self.logo_label.setStyleSheet("background-color: transparent;")
+                        self.log(f"Logo caricato: {logo_path.name}", "INFO")
+                        return
+                except Exception as e:
+                    self.log(f"Errore caricamento logo: {e}", "WARNING")
         
         # Logo non trovato, mantieni il placeholder "T"
-        pass
+        self.log("Logo non trovato in assets/ - usando placeholder", "WARNING")
         
     def init_ui(self):
         """Inizializza l'interfaccia utente"""
-        self.setWindowTitle("DIGIL SSH Connectivity Checker - Terna IoT Team")
-        self.setMinimumSize(1200, 800)
+        self.setWindowTitle("DIGIL Diagnostic Checker - Terna IoT Team")
+        self.setMinimumSize(1400, 850)
         
         # Widget centrale
         central_widget = QWidget()
@@ -400,7 +544,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(progress_widget)
         
         # Tabella risultati
-        table_group = QGroupBox("Risultati Test")
+        table_group = QGroupBox("Risultati Test Diagnostici")
         table_layout = QVBoxLayout(table_group)
         self.results_table = self.create_results_table()
         table_layout.addWidget(self.results_table)
@@ -456,11 +600,11 @@ class MainWindow(QMainWindow):
         title_layout.setContentsMargins(15, 0, 0, 0)
         title_layout.setSpacing(2)
         
-        title = QLabel("DIGIL SSH Connectivity Checker")
+        title = QLabel("DIGIL Diagnostic Checker")
         title.setObjectName("headerTitle")
         title_layout.addWidget(title)
         
-        subtitle = QLabel("Verifica raggiungibilità dispositivi IoT - Terna S.p.A.")
+        subtitle = QLabel("Verifica connettività e diagnostica IoT - Terna S.p.A.")
         subtitle.setObjectName("headerSubtitle")
         title_layout.addWidget(subtitle)
         
@@ -468,7 +612,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         
         # Info versione
-        version_label = QLabel("v1.0.0")
+        version_label = QLabel("v2.0.0")
         version_label.setStyleSheet("color: #999999; font-size: 11px;")
         layout.addWidget(version_label)
         
@@ -486,7 +630,7 @@ class MainWindow(QMainWindow):
         
         # File Anagrafica (Monitoraggio)
         anagrafica_layout = QVBoxLayout()
-        anagrafica_label = QLabel("📁 File Anagrafica (Monitoraggio DIGIL):")
+        anagrafica_label = QLabel("📁 File Anagrafica:")
         anagrafica_label.setStyleSheet("font-weight: bold;")
         anagrafica_layout.addWidget(anagrafica_label)
         
@@ -495,7 +639,7 @@ class MainWindow(QMainWindow):
         self.file_path_label.setStyleSheet("color: #666666; font-style: italic;")
         anagrafica_btn_layout.addWidget(self.file_path_label, stretch=1)
         
-        self.load_file_btn = QPushButton("Carica Anagrafica")
+        self.load_file_btn = QPushButton("Carica")
         self.load_file_btn.setObjectName("secondaryButton")
         self.load_file_btn.clicked.connect(self.load_file)
         anagrafica_btn_layout.addWidget(self.load_file_btn)
@@ -511,7 +655,7 @@ class MainWindow(QMainWindow):
         
         # File Lista Test
         test_list_layout = QVBoxLayout()
-        test_list_label = QLabel("📋 Lista Dispositivi da Testare:")
+        test_list_label = QLabel("📋 Lista Dispositivi Test:")
         test_list_label.setStyleSheet("font-weight: bold;")
         test_list_layout.addWidget(test_list_label)
         
@@ -526,18 +670,9 @@ class MainWindow(QMainWindow):
         test_list_btn_layout.addWidget(self.load_test_list_btn)
         
         self.clear_test_list_btn = QPushButton("✕")
-        self.clear_test_list_btn.setFixedWidth(30)
+        self.clear_test_list_btn.setObjectName("clearButton")
+        self.clear_test_list_btn.setFixedWidth(35)
         self.clear_test_list_btn.setToolTip("Rimuovi lista test")
-        self.clear_test_list_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #CC3300;
-                color: white;
-                border: none;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background-color: #992600; }
-        """)
         self.clear_test_list_btn.clicked.connect(self.clear_test_list)
         self.clear_test_list_btn.setVisible(False)
         test_list_btn_layout.addWidget(self.clear_test_list_btn)
@@ -553,7 +688,7 @@ class MainWindow(QMainWindow):
         h_sep.setStyleSheet("color: #E0E0E0;")
         main_layout.addWidget(h_sep)
         
-        # === RIGA 2: Filtri, Opzioni e Azioni ===
+        # === RIGA 2: Filtri, Check da eseguire, Opzioni e Azioni ===
         options_layout = QHBoxLayout()
         options_layout.setSpacing(20)
         
@@ -570,7 +705,7 @@ class MainWindow(QMainWindow):
         self.vendor_combo.addItems(["Tutti", "INDRA", "SIRTI", "MII"])
         filter_row.addWidget(self.vendor_combo)
         
-        filter_row.addSpacing(20)
+        filter_row.addSpacing(10)
         
         filter_row.addWidget(QLabel("Tipo:"))
         self.type_combo = QComboBox()
@@ -586,6 +721,36 @@ class MainWindow(QMainWindow):
         v_sep2.setStyleSheet("color: #CCCCCC;")
         options_layout.addWidget(v_sep2)
         
+        # Check da eseguire
+        checks_layout = QVBoxLayout()
+        checks_label = QLabel("Check da eseguire:")
+        checks_label.setStyleSheet("font-weight: bold;")
+        checks_layout.addWidget(checks_label)
+        
+        checks_row = QHBoxLayout()
+        
+        self.check_ssh = QCheckBox("SSH/Ping")
+        self.check_ssh.setChecked(True)
+        self.check_ssh.setEnabled(False)  # Sempre attivo
+        checks_row.addWidget(self.check_ssh)
+        
+        self.check_api = QCheckBox("API Diagnostica")
+        self.check_api.setChecked(True)
+        checks_row.addWidget(self.check_api)
+        
+        self.check_mongodb = QCheckBox("MongoDB (24h)")
+        self.check_mongodb.setChecked(True)
+        checks_row.addWidget(self.check_mongodb)
+        
+        checks_layout.addLayout(checks_row)
+        options_layout.addLayout(checks_layout, stretch=1)
+        
+        # Separatore verticale
+        v_sep3 = QFrame()
+        v_sep3.setFrameShape(QFrame.VLine)
+        v_sep3.setStyleSheet("color: #CCCCCC;")
+        options_layout.addWidget(v_sep3)
+        
         # Opzioni test
         thread_layout = QVBoxLayout()
         thread_label = QLabel("Opzioni:")
@@ -593,7 +758,7 @@ class MainWindow(QMainWindow):
         thread_layout.addWidget(thread_label)
         
         thread_row = QHBoxLayout()
-        thread_row.addWidget(QLabel("Thread paralleli:"))
+        thread_row.addWidget(QLabel("Thread:"))
         self.threads_spin = QSpinBox()
         self.threads_spin.setRange(1, 50)
         self.threads_spin.setValue(10)
@@ -601,13 +766,13 @@ class MainWindow(QMainWindow):
         thread_row.addWidget(self.threads_spin)
         
         thread_layout.addLayout(thread_row)
-        options_layout.addLayout(thread_layout, stretch=1)
+        options_layout.addLayout(thread_layout, stretch=0)
         
         # Separatore verticale
-        v_sep3 = QFrame()
-        v_sep3.setFrameShape(QFrame.VLine)
-        v_sep3.setStyleSheet("color: #CCCCCC;")
-        options_layout.addWidget(v_sep3)
+        v_sep4 = QFrame()
+        v_sep4.setFrameShape(QFrame.VLine)
+        v_sep4.setStyleSheet("color: #CCCCCC;")
+        options_layout.addWidget(v_sep4)
         
         # Bottoni azione
         action_layout = QVBoxLayout()
@@ -646,7 +811,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_bar, stretch=3)
         
         # Stats in tempo reale
-        self.stats_label = QLabel("OK: 0 | KO: 0 | In corso: 0")
+        self.stats_label = QLabel("OK: 0 | KO: 0")
         self.stats_label.setStyleSheet("color: #666666; margin-left: 20px;")
         layout.addWidget(self.stats_label)
         
@@ -660,13 +825,14 @@ class MainWindow(QMainWindow):
         return widget
     
     def create_results_table(self) -> QTableWidget:
-        """Crea la tabella risultati"""
+        """Crea la tabella risultati con colonne diagnostiche"""
         table = QTableWidget()
         
-        # Colonne
+        # Colonne estese per diagnostica
         columns = [
-            "Stato", "Linea", "Sostegno", "DeviceID", "IP Address",
-            "Vendor", "Tipo", "Ping", "SSH", "Note"
+            "Stato", "Linea", "Sostegno", "DeviceID", "IP",
+            "Vendor", "Tipo", "MongoDB", "LTE", "SSH",
+            "Batteria", "Porta", "Malfunzionamento", "Note"
         ]
         table.setColumnCount(len(columns))
         table.setHorizontalHeaderLabels(columns)
@@ -685,29 +851,25 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(3, QHeaderView.Stretch)  # DeviceID
         
         # Larghezze colonne
-        table.setColumnWidth(0, 80)   # Stato
-        table.setColumnWidth(1, 90)   # Linea
-        table.setColumnWidth(2, 150)  # Sostegno
-        table.setColumnWidth(3, 220)  # DeviceID
-        table.setColumnWidth(4, 120)  # IP
-        table.setColumnWidth(5, 70)   # Vendor
-        table.setColumnWidth(6, 60)   # Tipo
-        table.setColumnWidth(7, 100)  # Ping
-        table.setColumnWidth(8, 100)  # SSH
+        table.setColumnWidth(0, 50)   # Stato
+        table.setColumnWidth(1, 80)   # Linea
+        table.setColumnWidth(2, 140)  # Sostegno
+        table.setColumnWidth(3, 200)  # DeviceID
+        table.setColumnWidth(4, 110)  # IP
+        table.setColumnWidth(5, 55)   # Vendor
+        table.setColumnWidth(6, 55)   # Tipo
+        table.setColumnWidth(7, 65)   # MongoDB
+        table.setColumnWidth(8, 45)   # LTE
+        table.setColumnWidth(9, 45)   # SSH
+        table.setColumnWidth(10, 60)  # Batteria
+        table.setColumnWidth(11, 50)  # Porta
+        table.setColumnWidth(12, 130) # Malfunzionamento
         
         return table
     
     def apply_style(self):
         """Applica lo stile CSS"""
         self.setStyleSheet(TERNA_STYLE)
-    
-    def load_logo(self, logo_path: str):
-        """Carica il logo Terna"""
-        if os.path.exists(logo_path):
-            pixmap = QPixmap(logo_path)
-            self.logo_label.setPixmap(pixmap.scaled(120, 50, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            self.logo_label.setText("")
-            self.logo_label.setStyleSheet("background-color: transparent;")
     
     def log(self, message: str, level: str = "INFO"):
         """Aggiunge un messaggio al log"""
@@ -768,22 +930,6 @@ class MainWindow(QMainWindow):
             if success:
                 self.update_file_info()
                 self.log(f"File caricato: {count} dispositivi", "SUCCESS")
-                
-                # Chiedi se copiare il file nella directory dati
-                reply = QMessageBox.question(
-                    self,
-                    "Aggiorna File Predefinito",
-                    "Vuoi impostare questo file come predefinito per i prossimi avvii?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No
-                )
-                
-                if reply == QMessageBox.Yes:
-                    success, msg = update_monitoring_file(file_path)
-                    if success:
-                        self.log(msg, "SUCCESS")
-                    else:
-                        self.log(msg, "ERROR")
             else:
                 QMessageBox.warning(self, "Errore", msg)
                 self.log(msg, "ERROR")
@@ -831,7 +977,6 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
         
-        # Carica la lista SENZA header (i DeviceID partono dalla riga 1, colonna A)
         success, msg, count = self.data_loader.load_test_list(
             file_path, 
             device_id_column=0,
@@ -839,19 +984,14 @@ class MainWindow(QMainWindow):
         )
         
         if success:
-            self.test_list_label.setText(f"✓ {Path(file_path).name} ({count} dispositivi)")
+            self.test_list_label.setText(f"✓ {Path(file_path).name} ({count})")
             self.test_list_label.setStyleSheet("color: #009933;")
             self.clear_test_list_btn.setVisible(True)
             self.log(f"Lista test caricata: {count} dispositivi", "SUCCESS")
             
-            # Aggiorna info con eventuale warning per DeviceID non trovati
             summary = self.data_loader.get_summary()
             if summary.get('not_found_count', 0) > 0:
                 not_found = summary['not_found_in_anagrafica']
-                warning_msg = (f"⚠️ {len(not_found)} DeviceID non trovati in anagrafica:\n\n"
-                              f"{chr(10).join(not_found[:10])}"
-                              f"{chr(10) + '...' if len(not_found) > 10 else ''}")
-                QMessageBox.warning(self, "DeviceID Non Trovati", warning_msg)
                 self.log(f"Attenzione: {len(not_found)} DeviceID non trovati in anagrafica", "WARNING")
             
             self.update_file_info()
@@ -866,9 +1006,9 @@ class MainWindow(QMainWindow):
         self.test_list_label.setStyleSheet("color: #666666; font-style: italic;")
         self.clear_test_list_btn.setVisible(False)
         self.update_file_info()
-        self.log("Lista test rimossa - verranno testati tutti i dispositivi", "INFO")
+        self.log("Lista test rimossa", "INFO")
     
-    def get_filtered_devices(self) -> list[DeviceInfo]:
+    def get_filtered_devices(self) -> list:
         """Ottiene i dispositivi filtrati"""
         vendor_filter = self.vendor_combo.currentText()
         if vendor_filter == "Tutti":
@@ -884,7 +1024,7 @@ class MainWindow(QMainWindow):
         )
     
     def start_test(self):
-        """Avvia i test di connettività"""
+        """Avvia i test diagnostici"""
         devices = self.get_filtered_devices()
         
         if not devices:
@@ -896,13 +1036,20 @@ class MainWindow(QMainWindow):
             return
         
         # Conferma
+        checks = []
+        if self.check_ssh.isChecked():
+            checks.append("SSH/Ping")
+        if self.check_api.isChecked():
+            checks.append("API Diagnostica")
+        if self.check_mongodb.isChecked():
+            checks.append("MongoDB 24h")
+        
         reply = QMessageBox.question(
             self,
             "Conferma Avvio Test",
-            f"Avviare il test di connettività per {len(devices)} dispositivi?\n\n"
-            f"Thread paralleli: {self.threads_spin.value()}\n\n"
-            "NOTA: Il tool verificherà solo la raggiungibilità,\n"
-            "senza MAI accedere ai dispositivi.",
+            f"Avviare i test diagnostici per {len(devices)} dispositivi?\n\n"
+            f"Check attivi: {', '.join(checks)}\n"
+            f"Thread paralleli: {self.threads_spin.value()}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes
         )
@@ -921,32 +1068,41 @@ class MainWindow(QMainWindow):
         self.export_btn.setEnabled(False)
         self.load_file_btn.setEnabled(False)
         
-        self.log(f"Avvio test per {len(devices)} dispositivi...", "INFO")
+        self.log(f"Avvio test diagnostici per {len(devices)} dispositivi...", "INFO")
         
         # Popola tabella con stato "In attesa"
         for device in devices:
             self.add_device_to_table(device)
         
         # Avvia worker thread
-        self.worker_thread = WorkerThread(devices, self.threads_spin.value())
+        self.worker_thread = DiagnosticWorkerThread(
+            devices, 
+            self.threads_spin.value(),
+            check_ssh=self.check_ssh.isChecked(),
+            check_api=self.check_api.isChecked(),
+            check_mongodb=self.check_mongodb.isChecked()
+        )
         self.worker_thread.progress_signal.connect(self.on_progress)
         self.worker_thread.completed_signal.connect(self.on_completed)
         self.worker_thread.error_signal.connect(self.on_error)
         self.worker_thread.bridge_status_signal.connect(self.on_bridge_status)
+        self.worker_thread.phase_signal.connect(self.on_phase_change)
         self.worker_thread.start()
+    
+    def on_phase_change(self, phase: str):
+        """Callback per cambio fase"""
+        self.log(f"📌 {phase}", "INFO")
+        self.status_label.setText(phase)
     
     def on_bridge_status(self, connected, message: str):
         """Callback per stato connessione macchina ponte"""
         if connected is None:
-            # Tentativo di connessione in corso
             self.log(f"🔌 {message}", "INFO")
-            self.status_label.setText(f"Connessione al ponte...")
+            self.status_label.setText("Connessione al ponte...")
         elif connected:
-            # Connesso con successo
             self.log(f"✅ PONTE CONNESSO: {message}", "SUCCESS")
-            self.status_label.setText(f"Ponte connesso - Avvio test...")
+            self.status_label.setText("Ponte connesso - Avvio test...")
         else:
-            # Connessione fallita
             self.log(f"❌ PONTE NON RAGGIUNGIBILE: {message}", "ERROR")
             self.status_label.setText(f"Errore: {message}")
     
@@ -957,49 +1113,92 @@ class MainWindow(QMainWindow):
             self.log("Interruzione richiesta...", "WARNING")
             self.stop_btn.setEnabled(False)
     
-    def add_device_to_table(self, device: DeviceInfo):
-        """Aggiunge un dispositivo alla tabella"""
+    def add_device_to_table(self, device):
+        """Aggiunge un dispositivo alla tabella con stato 'In attesa' (arancione)"""
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
+        
+        # Colore arancione per "in attesa"
+        waiting_color = QColor("#FFF3CD")  # Arancione chiaro
         
         # Stato
         status_item = QTableWidgetItem("⏳")
         status_item.setTextAlignment(Qt.AlignCenter)
+        status_item.setBackground(waiting_color)
         self.results_table.setItem(row, 0, status_item)
         
-        # Dati
-        self.results_table.setItem(row, 1, QTableWidgetItem(device.linea))
-        self.results_table.setItem(row, 2, QTableWidgetItem(device.sostegno))
-        self.results_table.setItem(row, 3, QTableWidgetItem(device.device_id))
-        self.results_table.setItem(row, 4, QTableWidgetItem(device.ip_address))
-        self.results_table.setItem(row, 5, QTableWidgetItem(device.vendor.value))
-        self.results_table.setItem(row, 6, QTableWidgetItem(device.device_type.value))
-        self.results_table.setItem(row, 7, QTableWidgetItem("-"))
-        self.results_table.setItem(row, 8, QTableWidgetItem("-"))
-        self.results_table.setItem(row, 9, QTableWidgetItem(""))
+        # Dati base - tutti con sfondo arancione
+        items_data = [
+            device.linea,
+            device.sostegno, 
+            device.device_id,
+            device.ip_address,
+            device.vendor.value,
+            device.device_type.value
+        ]
         
-        # Salva riferimento al device_id per aggiornamento
+        for col, text in enumerate(items_data, start=1):
+            item = QTableWidgetItem(text)
+            item.setBackground(waiting_color)
+            self.results_table.setItem(row, col, item)
+        
+        # Colonne diagnostiche (vuote inizialmente) - tutte arancione
+        for col in range(7, 14):
+            item = QTableWidgetItem("-")
+            item.setBackground(waiting_color)
+            self.results_table.setItem(row, col, item)
+        
+        # Salva riferimento al device_id
         status_item.setData(Qt.UserRole, device.device_id)
     
-    def update_device_in_table(self, device: DeviceInfo):
+    def set_device_testing(self, device_id: str, phase: str = ""):
+        """Imposta un dispositivo come 'in corso di test' (blu)"""
+        for row in range(self.results_table.rowCount()):
+            item = self.results_table.item(row, 0)
+            if item and item.data(Qt.UserRole) == device_id:
+                testing_color = QColor("#CCE5FF")  # Blu chiaro
+                item.setText("🔄")
+                
+                # Colora tutta la riga blu
+                for col in range(self.results_table.columnCount()):
+                    cell = self.results_table.item(row, col)
+                    if cell:
+                        cell.setBackground(testing_color)
+                
+                # Mostra la fase corrente nella colonna Note (ultima colonna)
+                note_col = self.results_table.columnCount() - 1
+                note_item = self.results_table.item(row, note_col)
+                if note_item and phase:
+                    note_item.setText(phase)
+                
+                break
+    
+    def update_device_in_table(self, device):
         """Aggiorna lo stato di un dispositivo nella tabella"""
-        # Trova la riga
         for row in range(self.results_table.rowCount()):
             item = self.results_table.item(row, 0)
             if item and item.data(Qt.UserRole) == device.device_id:
-                # Aggiorna stato
-                if device.ssh_status == ConnectionStatus.SSH_PORT_OPEN:
+                # Determina stato generale
+                ssh_ok = device.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(device, 'ssh_status') else None
+                mongodb_ok = getattr(device, 'mongodb_has_data', None)
+                lte_ok = getattr(device, 'lte_ok', None)
+                battery_ok = getattr(device, 'battery_ok', None)
+                door_open = getattr(device, 'door_open', None)
+                malfunction = getattr(device, 'malfunction_type', '')
+                
+                # Icona stato
+                if malfunction == "OK":
                     status = "✅"
                     status_color = QColor("#C6EFCE")
-                elif device.ping_status == ConnectionStatus.PING_OK:
+                elif malfunction in ["Disconnesso", "Allarme batteria"]:
+                    status = "❌"
+                    status_color = QColor("#FFC7CE")
+                elif mongodb_ok == False or lte_ok == False:
                     status = "⚠️"
                     status_color = QColor("#FFEB9C")
-                elif device.ping_status == ConnectionStatus.VPN_ERROR:
-                    status = "🔌"
-                    status_color = QColor("#FFC7CE")
-                elif device.ping_status == ConnectionStatus.PENDING:
-                    status = "🔄"
-                    status_color = QColor("#FFFFFF")
+                elif ssh_ok:
+                    status = "✅"
+                    status_color = QColor("#C6EFCE")
                 else:
                     status = "❌"
                     status_color = QColor("#FFC7CE")
@@ -1012,40 +1211,73 @@ class MainWindow(QMainWindow):
                     if cell:
                         cell.setBackground(status_color)
                 
-                # Aggiorna ping
-                ping_text = device.ping_status.value
-                if device.ping_time_ms:
-                    ping_text += f" ({device.ping_time_ms:.1f}ms)"
-                self.results_table.item(row, 7).setText(ping_text)
+                # Aggiorna colonne diagnostiche
+                # MongoDB
+                if mongodb_ok is True:
+                    ts = getattr(device, 'mongodb_last_timestamp', None)
+                    mongo_text = ts.strftime("%d/%m/%Y %H:%M") if ts else "Data"
+                elif mongodb_ok is False:
+                    mongo_text = "KO"
+                else:
+                    mongo_error = getattr(device, 'mongodb_error', '')
+                    mongo_text = mongo_error[:15] if mongo_error else "-"
+                self.results_table.item(row, 7).setText(mongo_text)
                 
-                # Aggiorna SSH
-                self.results_table.item(row, 8).setText(device.ssh_status.value)
+                # LTE
+                lte_text = "OK" if lte_ok else ("KO" if lte_ok is False else "0")
+                self.results_table.item(row, 8).setText(lte_text)
                 
-                # Aggiorna note
-                self.results_table.item(row, 9).setText(device.error_message)
+                # SSH
+                ssh_text = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                self.results_table.item(row, 9).setText(ssh_text)
+                
+                # Batteria
+                battery_text = "OK" if battery_ok else ("KO" if battery_ok is False else "-")
+                self.results_table.item(row, 10).setText(battery_text)
+                
+                # Porta
+                door_text = "KO" if door_open else ("OK" if door_open is False else "-")
+                self.results_table.item(row, 11).setText(door_text)
+                
+                # Malfunzionamento
+                self.results_table.item(row, 12).setText(malfunction if malfunction else "-")
+                
+                # Note
+                errors = []
+                if hasattr(device, 'error_message') and device.error_message:
+                    errors.append(device.error_message)
+                if hasattr(device, 'api_error') and device.api_error:
+                    errors.append(device.api_error)
+                if hasattr(device, 'mongodb_error') and device.mongodb_error:
+                    errors.append(device.mongodb_error)
+                self.results_table.item(row, 13).setText("; ".join(errors)[:50] if errors else "")
                 
                 break
     
-    def on_progress(self, device: DeviceInfo, message: str, current: int, total: int):
-        """Callback progresso dal worker thread"""
+    def on_progress(self, device, message: str, current: int, total: int):
+        """Callback progresso - mostra cosa sta facendo il tool"""
         self.progress_bar.setValue(current)
-        self.update_device_in_table(device)
+        
+        # Se il messaggio indica che il test è "in corso", colora la riga blu
+        # Se è "Completato" o contiene risultati finali, aggiorna normalmente
+        if "Completato" in message or device.test_timestamp:
+            self.update_device_in_table(device)
+        else:
+            # Test in corso - colora blu e mostra fase
+            self.set_device_testing(device.device_id, message[:30] if message else "Testing...")
         
         # Aggiorna statistiche
-        ok_count = sum(1 for r in self.results if r.ssh_status == ConnectionStatus.SSH_PORT_OPEN)
-        ko_count = sum(1 for r in self.results if r.ping_status in [
-            ConnectionStatus.PING_FAILED, ConnectionStatus.ERROR, ConnectionStatus.VPN_ERROR
-        ])
+        ok_count = sum(1 for r in self.results if getattr(r, 'malfunction_type', '') == "OK")
+        ko_count = sum(1 for r in self.results if getattr(r, 'malfunction_type', '') and getattr(r, 'malfunction_type', '') != "OK")
         in_progress = total - len(self.results)
         
         self.stats_label.setText(f"OK: {ok_count} | KO: {ko_count} | In corso: {in_progress}")
-        self.status_label.setText(f"Testing: {device.device_id}")
+        self.status_label.setText(f"{message[:50]}..." if len(message) > 50 else message)
     
-    def on_completed(self, results: list[DeviceInfo]):
-        """Callback completamento dal worker thread"""
+    def on_completed(self, results: list):
+        """Callback completamento"""
         self.results = results
         
-        # Aggiorna tutti nella tabella
         for device in results:
             self.update_device_in_table(device)
         
@@ -1056,13 +1288,12 @@ class MainWindow(QMainWindow):
         self.load_file_btn.setEnabled(True)
         
         # Statistiche finali
-        ok_count = sum(1 for r in results if r.ssh_status == ConnectionStatus.SSH_PORT_OPEN)
+        ok_count = sum(1 for r in results if getattr(r, 'malfunction_type', '') == "OK")
         ko_count = len(results) - ok_count
         
         self.status_label.setText(f"Completato: {ok_count} OK, {ko_count} problemi su {len(results)} dispositivi")
         self.log(f"Test completato: {ok_count} OK, {ko_count} problemi", "SUCCESS" if ko_count == 0 else "WARNING")
         
-        # Notifica
         QMessageBox.information(
             self,
             "Test Completato",
@@ -1073,10 +1304,9 @@ class MainWindow(QMainWindow):
         )
     
     def on_error(self, error_message: str):
-        """Callback errore dal worker thread"""
+        """Callback errore"""
         self.log(f"Errore: {error_message}", "ERROR")
         
-        # Ripristina UI
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.load_file_btn.setEnabled(True)
@@ -1089,8 +1319,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Nessun Risultato", "Nessun risultato da esportare.")
             return
         
-        # Dialog per salvare
-        default_name = f"DIGIL_SSH_Check_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        default_name = f"DIGIL_Diagnostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Salva Risultati",
@@ -1099,7 +1328,7 @@ class MainWindow(QMainWindow):
         )
         
         if file_path:
-            success, result = self.result_exporter.export_results(self.results, file_path)
+            success, result = self.result_exporter.export_diagnostic_results(self.results, file_path)
             
             if success:
                 self.log(f"Risultati esportati: {result}", "SUCCESS")
@@ -1118,9 +1347,9 @@ class MainWindow(QMainWindow):
                     
                     if platform.system() == 'Windows':
                         os.startfile(result)
-                    elif platform.system() == 'Darwin':  # macOS
+                    elif platform.system() == 'Darwin':
                         subprocess.call(['open', result])
-                    else:  # Linux
+                    else:
                         subprocess.call(['xdg-open', result])
             else:
                 QMessageBox.critical(self, "Errore Esportazione", result)
@@ -1140,21 +1369,31 @@ class MainWindow(QMainWindow):
             if reply == QMessageBox.Yes:
                 self.worker_thread.stop()
                 self.worker_thread.wait(5000)
+                self._cleanup_resources()
                 event.accept()
             else:
                 event.ignore()
         else:
+            self._cleanup_resources()
             event.accept()
+    
+    def _cleanup_resources(self):
+        """Pulisce le risorse (tunnel SSH, connessioni, ecc.)"""
+        try:
+            from mongodb_checker import cleanup_tunnel
+            cleanup_tunnel()
+            self.log("Tunnel SSH chiuso", "INFO")
+        except:
+            pass
 
 
 def main():
     """Entry point dell'applicazione"""
-    # High DPI support
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     
     app = QApplication(sys.argv)
-    app.setApplicationName("DIGIL SSH Checker")
+    app.setApplicationName("DIGIL Diagnostic Checker")
     app.setOrganizationName("Terna")
     
     # Icona (se disponibile)

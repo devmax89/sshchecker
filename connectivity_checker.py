@@ -14,11 +14,12 @@ import socket
 import paramiko
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 import os
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Carica variabili d'ambiente
 load_dotenv()
@@ -55,7 +56,7 @@ class Vendor(Enum):
 
 @dataclass
 class DeviceInfo:
-    """Informazioni di un dispositivo DIGIL"""
+    """Informazioni di un dispositivo DIGIL con campi diagnostici estesi"""
     device_id: str
     ip_address: str
     linea: str
@@ -64,39 +65,50 @@ class DeviceInfo:
     device_type: DeviceType = DeviceType.UNKNOWN
     vendor: Vendor = Vendor.UNKNOWN
     
-    # Risultati test
+    # Risultati test SSH/Ping
     ping_status: ConnectionStatus = ConnectionStatus.PENDING
     ssh_status: ConnectionStatus = ConnectionStatus.PENDING
     ping_time_ms: Optional[float] = None
     error_message: str = ""
     test_timestamp: Optional[str] = None
+    
+    # Risultati API Diagnostica
+    api_data: Optional[dict] = None
+    api_error: str = ""
+    battery_ok: Optional[bool] = None
+    door_open: Optional[bool] = None
+    lte_ok: Optional[bool] = None
+    soc_percent: Optional[float] = None
+    soh_percent: Optional[float] = None
+    lte_signal_dbm: Optional[float] = None
+    channel: Optional[str] = None
+    
+    # Risultati MongoDB
+    mongodb_has_data: Optional[bool] = None
+    mongodb_last_timestamp: Optional[datetime] = None
+    mongodb_checked: bool = False
+    mongodb_error: str = ""
+    
+    # Classificazione malfunzionamento
+    malfunction_type: str = ""
 
 
 def detect_device_type(device_id: str) -> DeviceType:
     """
     Rileva automaticamente il tipo di device dal deviceid.
-    
-    Pattern:
-    - 1121525_xxxx → Master (contiene "15" nella parte centrale)
-    - 1121621_xxxx → Slave (contiene "16" nella parte centrale)
-    
-    Esempi:
-    - 1:1:2:16:21:DIGIL_MRN_0562 → slave
-    - 1:1:2:15:25:DIGIL_SR2_0103 → master
     """
     device_id_str = str(device_id)
     
     # Cerca nel formato 1:1:2:XX:YY:DIGIL_...
     parts = device_id_str.split(":")
     if len(parts) >= 4:
-        # La quarta parte (index 3) contiene 15 o 16
         type_indicator = parts[3]
         if type_indicator == "15":
             return DeviceType.MASTER
         elif type_indicator == "16":
             return DeviceType.SLAVE
     
-    # Fallback: cerca ovunque nel deviceid
+    # Fallback
     if "15" in device_id_str and "16" not in device_id_str:
         return DeviceType.MASTER
     elif "16" in device_id_str:
@@ -106,23 +118,10 @@ def detect_device_type(device_id: str) -> DeviceType:
 
 
 def detect_vendor(device_id: str, fornitore: str = "") -> Vendor:
-    """
-    Rileva il vendor dal deviceid o dalla colonna fornitore.
-    
-    Pattern nel deviceid:
-    - DIGIL_SR2_xxxx → SIRTI
-    - DIGIL_MRN_xxxx → MII (Marini)
-    - DIGIL_IND_xxxx → INDRA
-    
-    Pattern nel fornitore:
-    - Lotto1-IndraOlivetti → INDRA
-    - Lotto2-TelebitMarini → MII
-    - Lotto3-Sirti → SIRTI
-    """
+    """Rileva il vendor dal deviceid o dalla colonna fornitore."""
     device_id_upper = str(device_id).upper()
     fornitore_upper = str(fornitore).upper()
     
-    # Prima verifica dal deviceid (più affidabile)
     if "SR2" in device_id_upper or "_SR_" in device_id_upper:
         return Vendor.SIRTI
     elif "MRN" in device_id_upper or "_MR_" in device_id_upper:
@@ -130,7 +129,6 @@ def detect_vendor(device_id: str, fornitore: str = "") -> Vendor:
     elif "IND" in device_id_upper:
         return Vendor.INDRA
     
-    # Poi verifica dalla colonna fornitore
     if "SIRTI" in fornitore_upper:
         return Vendor.SIRTI
     elif "MARINI" in fornitore_upper or "TELEBIT" in fornitore_upper:
@@ -142,22 +140,14 @@ def detect_vendor(device_id: str, fornitore: str = "") -> Vendor:
 
 
 def normalize_ip(ip_raw) -> str:
-    """
-    Normalizza l'indirizzo IP.
-    Alcuni IP nel file sono senza punti (es: 10183224247 invece di 10.183.224.247)
-    """
+    """Normalizza l'indirizzo IP."""
     ip_str = str(ip_raw).strip()
     
-    # Se contiene già i punti, è già formattato
     if "." in ip_str:
         return ip_str
     
-    # Se è un numero lungo, prova a convertirlo
-    # Formato atteso: 10.183.224.xxx
     if ip_str.isdigit() and len(ip_str) >= 9:
-        # Pattern tipico: 10183224XXX -> 10.183.224.XXX
         try:
-            # Prova a ricostruire l'IP
             if ip_str.startswith("10183224"):
                 remaining = ip_str[8:]
                 return f"10.183.224.{remaining}"
@@ -181,15 +171,11 @@ class BridgeConnection:
         self.ssh_client: Optional[paramiko.SSHClient] = None
         self._lock = threading.Lock()
         
-        # Verifica che le credenziali siano configurate
         if not self.host or not self.user or not self.password:
             raise ValueError("Configurazione mancante nel file .env: BRIDGE_HOST, BRIDGE_USER, BRIDGE_PASSWORD")
         
     def connect(self) -> tuple[bool, str]:
-        """
-        Stabilisce la connessione alla macchina ponte.
-        Ritorna (success, message)
-        """
+        """Stabilisce la connessione alla macchina ponte."""
         with self._lock:
             if self.ssh_client and self.ssh_client.get_transport() and self.ssh_client.get_transport().is_active():
                 return True, "Già connesso"
@@ -235,10 +221,7 @@ class BridgeConnection:
                     self.ssh_client.get_transport().is_active())
     
     def execute_command(self, command: str, timeout: int = 10) -> tuple[bool, str, str]:
-        """
-        Esegue un comando sulla macchina ponte.
-        Ritorna (success, stdout, stderr)
-        """
+        """Esegue un comando sulla macchina ponte."""
         if not self.is_connected():
             success, msg = self.connect()
             if not success:
@@ -257,14 +240,11 @@ class BridgeConnection:
 class DeviceChecker:
     """Classe per verificare la connettività di un singolo dispositivo"""
     
-    # Timeout retry PING (aspettiamo il risveglio del device)
-    MASTER_PING_RETRY_TIMEOUT = 300   # 5 minuti per master
-    SLAVE_PING_RETRY_TIMEOUT = 1200   # 20 minuti per slave
-    PING_RETRY_INTERVAL = 10          # Riprova ogni 10 secondi
-    
-    # Retry SSH (device già sveglio, pochi tentativi bastano)
-    SSH_RETRY_ATTEMPTS = 5            # 5 tentativi per SSH
-    SSH_RETRY_INTERVAL = 2            # Riprova ogni 2 secondi
+    MASTER_PING_RETRY_TIMEOUT = 300
+    SLAVE_PING_RETRY_TIMEOUT = 1200
+    PING_RETRY_INTERVAL = 10
+    SSH_RETRY_ATTEMPTS = 5
+    SSH_RETRY_INTERVAL = 2
     
     def __init__(self, bridge: BridgeConnection):
         self.bridge = bridge
@@ -272,13 +252,8 @@ class DeviceChecker:
         self.ssh_port = int(os.getenv("SSH_PORT", "22"))
         
     def check_ping_single(self, device: DeviceInfo) -> tuple[ConnectionStatus, Optional[float], str]:
-        """
-        Esegue UN SINGOLO ping verso il dispositivo dalla macchina ponte.
-        Ritorna (status, ping_time_ms, error_message)
-        """
+        """Esegue UN SINGOLO ping verso il dispositivo."""
         ip = normalize_ip(device.ip_address)
-        
-        # Comando ping con timeout breve (2 pacchetti, timeout 2 secondi ciascuno)
         cmd = f"ping -c 2 -W 2 {ip}"
         
         success, stdout, stderr = self.bridge.execute_command(cmd, timeout=10)
@@ -286,11 +261,9 @@ class DeviceChecker:
         if not success:
             return ConnectionStatus.ERROR, None, stderr
         
-        # Analizza output ping
         if "0 received" in stdout or "100% packet loss" in stdout:
             return ConnectionStatus.PING_FAILED, None, "Nessuna risposta al ping"
         
-        # Cerca il tempo medio di risposta
         ping_time = None
         for line in stdout.split('\n'):
             if 'avg' in line.lower() and '/' in line:
@@ -303,7 +276,6 @@ class DeviceChecker:
         if "bytes from" in stdout or "0% packet loss" in stdout:
             return ConnectionStatus.PING_OK, ping_time, ""
         
-        # Anche 50% packet loss consideriamo OK
         if "1 received" in stdout or "50% packet loss" in stdout:
             return ConnectionStatus.PING_OK, ping_time, ""
         
@@ -311,18 +283,7 @@ class DeviceChecker:
     
     def check_ping(self, device: DeviceInfo,
                    progress_callback: Optional[Callable[[DeviceInfo, str], None]] = None) -> tuple[ConnectionStatus, Optional[float], str]:
-        """
-        Esegue ping verso il dispositivo con retry basato sul tipo:
-        - Master: 5 minuti (300s)
-        - Slave: 20 minuti (1200s) - aspetta il risveglio
-        
-        Ritorna (status, ping_time_ms, error_message)
-        
-        NOTA: Non accede MAI al dispositivo, solo verifica raggiungibilità.
-        """
-        import time
-        
-        # Determina timeout in base al tipo di device
+        """Esegue ping verso il dispositivo con retry."""
         if device.device_type == DeviceType.MASTER:
             max_retry_seconds = self.MASTER_PING_RETRY_TIMEOUT
             device_type_str = "Master"
@@ -345,7 +306,6 @@ class DeviceChecker:
                 time_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
                 progress_callback(device, f"Ping tentativo {attempt} ({device_type_str}, {time_str} rimanenti)...")
             
-            # Prova ping
             status, ping_time, error = self.check_ping_single(device)
             
             if status == ConnectionStatus.PING_OK:
@@ -353,31 +313,20 @@ class DeviceChecker:
             
             last_error = error
             
-            # Controlla se abbiamo superato il timeout
             if elapsed >= max_retry_seconds:
                 minutes = max_retry_seconds // 60
                 return ConnectionStatus.PING_FAILED, None, f"Ping fallito dopo {attempt} tentativi ({minutes} min). {last_error}"
             
-            # Aspetta prima di riprovare
             time.sleep(self.PING_RETRY_INTERVAL)
     
     def check_ssh_port(self, device: DeviceInfo) -> tuple[ConnectionStatus, str]:
-        """
-        Verifica se la porta SSH è aperta sul dispositivo.
-        
-        IMPORTANTE: NON esegue login, solo verifica che la porta risponda.
-        Usa nc (netcat) o un tentativo di connessione socket dalla macchina ponte.
-        """
+        """Verifica se la porta SSH è aperta sul dispositivo."""
         ip = normalize_ip(device.ip_address)
-        
-        # Usa timeout di netcat per verificare la porta
-        # -z = zero-I/O mode (solo scan), -w = timeout
         cmd = f"timeout 5 bash -c 'echo > /dev/tcp/{ip}/{self.ssh_port}' 2>&1 && echo 'PORT_OPEN' || echo 'PORT_CLOSED'"
         
         success, stdout, stderr = self.bridge.execute_command(cmd, timeout=10)
         
         if not success:
-            # Prova metodo alternativo con nc
             cmd_alt = f"nc -z -w 5 {ip} {self.ssh_port} && echo 'PORT_OPEN' || echo 'PORT_CLOSED'"
             success, stdout, stderr = self.bridge.execute_command(cmd_alt, timeout=10)
             
@@ -395,19 +344,13 @@ class DeviceChecker:
     
     def check_ssh_port_with_retry(self, device: DeviceInfo,
                                    progress_callback: Optional[Callable[[DeviceInfo, str], None]] = None) -> tuple[ConnectionStatus, str]:
-        """
-        Verifica porta SSH con 5 tentativi rapidi.
-        (Il device è già sveglio dopo il ping OK, quindi pochi retry bastano)
-        """
-        import time
-        
+        """Verifica porta SSH con retry."""
         last_error = ""
         
         for attempt in range(1, self.SSH_RETRY_ATTEMPTS + 1):
             if progress_callback:
                 progress_callback(device, f"SSH check tentativo {attempt}/{self.SSH_RETRY_ATTEMPTS}...")
             
-            # Prova SSH
             status, error = self.check_ssh_port(device)
             
             if status == ConnectionStatus.SSH_PORT_OPEN:
@@ -415,7 +358,6 @@ class DeviceChecker:
             
             last_error = error
             
-            # Se non è l'ultimo tentativo, aspetta prima di riprovare
             if attempt < self.SSH_RETRY_ATTEMPTS:
                 time.sleep(self.SSH_RETRY_INTERVAL)
         
@@ -423,29 +365,18 @@ class DeviceChecker:
     
     def full_check(self, device: DeviceInfo, 
                    progress_callback: Optional[Callable[[DeviceInfo, str], None]] = None) -> DeviceInfo:
-        """
-        Esegue il check completo di un dispositivo:
-        1. Ping con retry lunghi (aspetta risveglio: 5min master, 20min slave)
-        2. SSH con 5 retry rapidi (device già sveglio)
-        
-        NOTA: Non accede MAI al dispositivo.
-        """
-        from datetime import datetime
-        
+        """Esegue il check completo di un dispositivo."""
         device.test_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Determina tipo e vendor se non già fatto
         if device.device_type == DeviceType.UNKNOWN:
             device.device_type = detect_device_type(device.device_id)
         if device.vendor == Vendor.UNKNOWN:
             device.vendor = detect_vendor(device.device_id, device.fornitore)
         
-        # Notifica inizio test
         retry_minutes = self.MASTER_PING_RETRY_TIMEOUT // 60 if device.device_type == DeviceType.MASTER else self.SLAVE_PING_RETRY_TIMEOUT // 60
         if progress_callback:
             progress_callback(device, f"Ping in corso (max {retry_minutes} min per {device.device_type.value})...")
         
-        # Step 1: Ping CON RETRY LUNGHI (aspetta risveglio)
         device.ping_status, device.ping_time_ms, error = self.check_ping(device, progress_callback)
         
         if device.ping_status != ConnectionStatus.PING_OK:
@@ -455,7 +386,6 @@ class DeviceChecker:
                 progress_callback(device, f"Ping fallito: {error}")
             return device
         
-        # Step 2: SSH CON 5 RETRY RAPIDI (device già sveglio)
         if progress_callback:
             ping_ms = f"{device.ping_time_ms:.1f}ms" if device.ping_time_ms else "OK"
             progress_callback(device, f"Ping {ping_ms}! SSH check ({self.SSH_RETRY_ATTEMPTS} tentativi)...")
@@ -481,7 +411,6 @@ class MultiThreadChecker:
         self._stop_flag = threading.Event()
         self._results: list[DeviceInfo] = []
         self._results_lock = threading.Lock()
-        self._active_threads: list[threading.Thread] = []
         
     def stop(self):
         """Ferma l'esecuzione dei test"""
@@ -491,24 +420,14 @@ class MultiThreadChecker:
         """Reset per nuovo batch di test"""
         self._stop_flag.clear()
         self._results = []
-        self._active_threads = []
         
     def check_devices(self, devices: list[DeviceInfo],
                       progress_callback: Optional[Callable[[DeviceInfo, str, int, int], None]] = None,
                       completion_callback: Optional[Callable[[list[DeviceInfo]], None]] = None,
                       bridge_callback: Optional[Callable[[bool, str], None]] = None) -> list[DeviceInfo]:
-        """
-        Esegue i test su tutti i dispositivi in parallelo.
-        
-        Args:
-            devices: Lista di dispositivi da testare
-            progress_callback: Callback chiamata per ogni aggiornamento (device, message, current, total)
-            completion_callback: Callback chiamata al completamento
-            bridge_callback: Callback per stato connessione ponte (connected, message)
-        """
+        """Esegue i test su tutti i dispositivi in parallelo."""
         self.reset()
         
-        # Prima verifica connessione ponte
         if bridge_callback:
             bridge_callback(None, f"Connessione a {self.bridge.host}...")
         
@@ -518,7 +437,6 @@ class MultiThreadChecker:
             bridge_callback(success, msg)
         
         if not success:
-            # Tutti i dispositivi segnati come errore VPN/ponte
             for dev in devices:
                 dev.ping_status = ConnectionStatus.VPN_ERROR
                 dev.ssh_status = ConnectionStatus.VPN_ERROR
@@ -529,7 +447,7 @@ class MultiThreadChecker:
             return self._results
         
         total = len(devices)
-        completed = [0]  # Usa lista per permettere modifica in closure
+        completed = [0]
         
         def worker(device: DeviceInfo):
             if self._stop_flag.is_set():
@@ -550,7 +468,6 @@ class MultiThreadChecker:
             if progress_callback:
                 progress_callback(result, "Completato", completed[0], total)
         
-        # Crea thread pool
         from concurrent.futures import ThreadPoolExecutor, as_completed
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -567,7 +484,6 @@ class MultiThreadChecker:
                     dev.error_message = str(e)
                     dev.ping_status = ConnectionStatus.ERROR
         
-        # Cleanup
         self.bridge.disconnect()
         
         if completion_callback:
@@ -577,23 +493,14 @@ class MultiThreadChecker:
 
 
 if __name__ == "__main__":
-    # Test di base
     print("Test modulo connectivity_checker")
     
-    # Test detect_device_type
     test_ids = [
         "1:1:2:16:21:DIGIL_MRN_0562",
         "1:1:2:15:25:DIGIL_SR2_0103",
-        "1:1:2:16:25:DIGIL_SR2_0163",
-        "1:1:2:15:22:DIGIL_MRN_0053",
     ]
     
     for did in test_ids:
         dtype = detect_device_type(did)
         vendor = detect_vendor(did)
         print(f"{did} -> Type: {dtype.value}, Vendor: {vendor.value}")
-    
-    # Test normalize_ip
-    test_ips = ["10.183.224.97", "10183224247", "10183224250"]
-    for ip in test_ips:
-        print(f"IP: {ip} -> {normalize_ip(ip)}")
