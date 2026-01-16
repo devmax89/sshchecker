@@ -1258,13 +1258,21 @@ class MainWindow(QMainWindow):
         """Callback progresso - mostra cosa sta facendo il tool"""
         self.progress_bar.setValue(current)
         
-        # Se il messaggio indica che il test è "in corso", colora la riga blu
-        # Se è "Completato" o contiene risultati finali, aggiorna normalmente
-        if "Completato" in message or device.test_timestamp:
+        # Determina se il test per questo device è completato
+        # Un device è "completato" solo se:
+        # 1. Il messaggio contiene "Completato" 
+        # 2. E il device ha già un malfunction_type classificato (significa che tutti i check sono finiti)
+        is_completed = "Completato" in message and getattr(device, 'malfunction_type', '')
+        
+        if is_completed:
+            # Test finito - aggiorna con colori finali (verde/rosso/giallo)
             self.update_device_in_table(device)
+            # Aggiungi ai risultati se non già presente
+            if device not in self.results:
+                self.results.append(device)
         else:
-            # Test in corso - colora blu e mostra fase
-            self.set_device_testing(device.device_id, message[:30] if message else "Testing...")
+            # Test in corso - mostra blu con icona rotazione
+            self.set_device_testing(device.device_id, message[:40] if message else "Testing...")
         
         # Aggiorna statistiche
         ok_count = sum(1 for r in self.results if getattr(r, 'malfunction_type', '') == "OK")
