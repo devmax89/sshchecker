@@ -354,6 +354,7 @@ class ResultExporter:
                     "SOH %": getattr(r, 'soh_percent', None) or "",
                     "Segnale dBm": getattr(r, 'lte_signal_dbm', None) or "",
                     "Canale": getattr(r, 'channel', None) or "",
+                    "API Timestamp": getattr(r, 'api_timestamp', None) or "",
                     "Tipo Malfunzionamento": malfunction,
                     "Note": note,
                     "Timestamp Test": r.test_timestamp if hasattr(r, 'test_timestamp') else ""
@@ -402,9 +403,10 @@ class ResultExporter:
                 column_widths = {
                     'Linea': 10, 'ST Sostegno': 20, 'DeviceID': 28, 'IP Address': 14,
                     'Vendor': 8, 'Tipo': 8, 'Tipo Installazione AM': 18,
-                    'Check MongoDB': 12, 'Check LTE': 10,
+                    'Check MongoDB (24h)': 12, 'Check LTE': 10,
                     'Check SSH': 10, 'Batteria': 9, 'Porta': 7, 'SOC %': 7, 'SOH %': 7,
-                    'Segnale dBm': 11, 'Canale': 8, 'Tipo Malfunzionamento': 18, 
+                    'Segnale dBm': 11, 'Canale': 8, 'API Timestamp': 18,
+                    'Tipo Malfunzionamento': 18, 
                     'Note': 30, 'Timestamp Test': 18
                 }
                 

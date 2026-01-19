@@ -157,7 +157,8 @@ class DigilAPIClient:
             "channel": None,
             "status": data.get("status"),
             "vendor": data.get("vendor"),
-            "typology": data.get("typology")
+            "typology": data.get("typology"),
+            "api_timestamp": None  # Timestamp decodificato dalla risposta API
         }
         
         # Status connessione
@@ -167,6 +168,32 @@ class DigilAPIClient:
         # I dati sono in "diags" (allarmi) e "measures" (misure)
         diags = data.get("diags", {})
         measures = data.get("measures", {})
+        
+        # === ESTRAI TIMESTAMP PIÙ RECENTE ===
+        # Cerca il timestamp più recente tra tutte le metriche
+        latest_timestamp = None
+        
+        # Controlla timestamp nelle measures
+        for metric_name, metric_data in measures.items():
+            if isinstance(metric_data, dict):
+                ts = metric_data.get("timestamp") or metric_data.get("receivedOn")
+                if ts and (latest_timestamp is None or ts > latest_timestamp):
+                    latest_timestamp = ts
+        
+        # Controlla timestamp nei diags
+        for diag_name, diag_data in diags.items():
+            if isinstance(diag_data, dict):
+                ts = diag_data.get("timestamp") or diag_data.get("receivedOn")
+                if ts and (latest_timestamp is None or ts > latest_timestamp):
+                    latest_timestamp = ts
+        
+        # Se non trovato nelle metriche, prova il campo principale
+        if latest_timestamp is None:
+            latest_timestamp = data.get("lastUpdate") or data.get("receivedOn") or data.get("timestamp")
+        
+        # Decodifica il timestamp
+        if latest_timestamp:
+            result["api_timestamp"] = self._decode_timestamp(latest_timestamp)
         
         # === DIAGS (Allarmi) ===
         
@@ -219,6 +246,47 @@ class DigilAPIClient:
                 result["lte_signal_dbm"] = float(nbiot_signal)
         
         return result
+    
+    def _decode_timestamp(self, timestamp) -> Optional[str]:
+        """
+        Decodifica un timestamp in formato leggibile.
+        
+        Supporta:
+        - Millisecondi Unix (es: 1737297942000)
+        - Secondi Unix (es: 1737297942)
+        - Stringa ISO già formattata
+        
+        Returns:
+            Stringa nel formato "YYYY-MM-DD HH:MM:SS" o None
+        """
+        if timestamp is None:
+            return None
+        
+        try:
+            # Se è già una stringa formattata, prova a parsarla
+            if isinstance(timestamp, str):
+                # Prova formato ISO
+                if 'T' in timestamp or '-' in timestamp:
+                    # Rimuovi timezone se presente
+                    ts_clean = timestamp.split('+')[0].split('Z')[0]
+                    dt = datetime.fromisoformat(ts_clean)
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                # Prova a convertirlo in numero
+                timestamp = int(timestamp)
+            
+            # Se è un numero (int o float)
+            if isinstance(timestamp, (int, float)):
+                # Se il timestamp è in millisecondi (> anno 2100 in secondi)
+                if timestamp > 4102444800:  # 2100-01-01 in secondi
+                    timestamp = timestamp / 1000
+                
+                dt = datetime.fromtimestamp(timestamp)
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+        except Exception as e:
+            print(f"Errore decodifica timestamp {timestamp}: {e}")
+        
+        return None
 
 
 if __name__ == "__main__":
@@ -239,3 +307,16 @@ if __name__ == "__main__":
     for did in test_ids:
         converted = client._convert_device_id(did)
         print(f"{did} -> {converted}")
+    
+    # Test decodifica timestamp
+    test_timestamps = [
+        1737297942000,  # millisecondi
+        1737297942,     # secondi
+        "2025-01-19T15:25:42.000Z",  # ISO
+        "2025-01-19T15:25:42+01:00"  # ISO con timezone
+    ]
+    
+    print("\nTest decodifica timestamp:")
+    for ts in test_timestamps:
+        decoded = client._decode_timestamp(ts)
+        print(f"  {ts} -> {decoded}")

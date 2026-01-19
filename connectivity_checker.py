@@ -78,6 +78,7 @@ class DeviceInfo:
     # Risultati API Diagnostica
     api_data: Optional[dict] = None
     api_error: str = ""
+    api_timestamp: Optional[str] = None  # Timestamp decodificato dalla risposta API
     battery_ok: Optional[bool] = None
     door_open: Optional[bool] = None
     lte_ok: Optional[bool] = None

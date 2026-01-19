@@ -347,6 +347,7 @@ class DiagnosticWorkerThread(QThread):
                         device.soh_percent = api_result.get('soh_percent', None)
                         device.lte_signal_dbm = api_result.get('lte_signal_dbm', None)
                         device.channel = api_result.get('channel', None)
+                        device.api_timestamp = api_result.get('api_timestamp', None)
                 except Exception as e:
                     device.api_error = str(e)[:100]
                     
