@@ -1242,15 +1242,26 @@ class MainWindow(QMainWindow):
                 # Malfunzionamento
                 self.results_table.item(row, 12).setText(malfunction if malfunction else "-")
                 
-                # Note
-                errors = []
-                if hasattr(device, 'error_message') and device.error_message:
-                    errors.append(device.error_message)
-                if hasattr(device, 'api_error') and device.api_error:
-                    errors.append(device.api_error)
-                if hasattr(device, 'mongodb_error') and device.mongodb_error:
-                    errors.append(device.mongodb_error)
-                self.results_table.item(row, 13).setText("; ".join(errors)[:50] if errors else "")
+                # Note - con logica "Verificare Tiro"
+                tipo_inst = getattr(device, 'tipo_installazione_am', '')
+                
+                if malfunction == "OK" and tipo_inst == "Inst. Completa":
+                    note_text = "Verificare Tiro"
+                    # Colora la cella Note in giallo/arancione
+                    note_item = self.results_table.item(row, 13)
+                    if note_item:
+                        note_item.setBackground(QColor("#FFEB9C"))
+                else:
+                    errors = []
+                    if hasattr(device, 'error_message') and device.error_message:
+                        errors.append(device.error_message)
+                    if hasattr(device, 'api_error') and device.api_error:
+                        errors.append(device.api_error)
+                    if hasattr(device, 'mongodb_error') and device.mongodb_error:
+                        errors.append(device.mongodb_error)
+                    note_text = "; ".join(errors)[:50] if errors else ""
+                
+                self.results_table.item(row, 13).setText(note_text)
                 
                 break
     

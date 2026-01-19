@@ -70,16 +70,44 @@ class DataLoader:
                 engine='openpyxl'
             )
             
+            # Colonne richieste
             required_cols = ['DeviceID', 'IP address SIM', 'Linea', 'ST Sostegno']
             missing = [c for c in required_cols if c not in self._df.columns]
             
             if missing:
                 return False, f"Colonne mancanti nel file: {missing}", 0
             
+            # Verifica se esiste la colonna "Tipo Installazione AM" (colonna A)
+            # Potrebbe avere nomi leggermente diversi
+            tipo_inst_col = None
+            possible_names = ['Tipo Installazione AM', 'Tipo installazione AM', 
+                            'TIPO INSTALLAZIONE AM', 'Tipo_Installazione_AM']
+            
+            for col_name in possible_names:
+                if col_name in self._df.columns:
+                    tipo_inst_col = col_name
+                    break
+            
+            # Se non trovata con il nome, prova a usare la prima colonna (colonna A)
+            if tipo_inst_col is None:
+                # La colonna A dopo header=1 dovrebbe essere la prima
+                first_col = self._df.columns[0]
+                if 'tipo' in str(first_col).lower() or 'installazione' in str(first_col).lower():
+                    tipo_inst_col = first_col
+            
+            self._tipo_installazione_col = tipo_inst_col
+            
             self._df = self._df.dropna(subset=['DeviceID', 'IP address SIM'])
             
             self.monitoring_file = path
-            return True, f"Anagrafica caricata: {len(self._df)} dispositivi", len(self._df)
+            
+            msg = f"Anagrafica caricata: {len(self._df)} dispositivi"
+            if tipo_inst_col:
+                msg += f" (colonna '{tipo_inst_col}' trovata)"
+            else:
+                msg += " (colonna 'Tipo Installazione AM' non trovata)"
+            
+            return True, msg, len(self._df)
             
         except Exception as e:
             return False, f"Errore caricamento file: {str(e)}", 0
@@ -181,6 +209,13 @@ class DataLoader:
                 if device_type.value.lower() != filter_type.lower():
                     continue
             
+            # Leggi "Tipo Installazione AM" se disponibile
+            tipo_installazione_am = ""
+            if hasattr(self, '_tipo_installazione_col') and self._tipo_installazione_col:
+                tipo_inst_value = row.get(self._tipo_installazione_col, '')
+                if pd.notna(tipo_inst_value):
+                    tipo_installazione_am = str(tipo_inst_value).strip()
+            
             device = DeviceInfo(
                 device_id=device_id,
                 ip_address=ip,
@@ -188,7 +223,8 @@ class DataLoader:
                 sostegno=str(row.get('ST Sostegno', '')),
                 fornitore=fornitore,
                 device_type=device_type,
-                vendor=vendor
+                vendor=vendor,
+                tipo_installazione_am=tipo_installazione_am
             )
             
             devices.append(device)
@@ -227,7 +263,8 @@ class DataLoader:
             "test_list_file": str(self.test_list_file) if self.test_list_file else "",
             "test_list_count": len(self._test_device_ids),
             "not_found_in_anagrafica": not_found,
-            "not_found_count": len(not_found)
+            "not_found_count": len(not_found),
+            "has_tipo_installazione": hasattr(self, '_tipo_installazione_col') and self._tipo_installazione_col is not None
         }
 
 
@@ -238,6 +275,33 @@ class ResultExporter:
         self.output_dir = Path.home() / "Downloads"
         if not self.output_dir.exists():
             self.output_dir = Path.cwd()
+    
+    def _get_note_for_device(self, device) -> str:
+        """
+        Genera la nota per un dispositivo.
+        
+        Logica:
+        - Se malfunction_type == "OK" E tipo_installazione_am == "Inst. Completa"
+          -> "Verificare Tiro"
+        - Altrimenti mostra eventuali errori
+        """
+        # Controlla la condizione speciale per "Verificare Tiro"
+        malfunction = getattr(device, 'malfunction_type', '')
+        tipo_inst = getattr(device, 'tipo_installazione_am', '')
+        
+        if malfunction == "OK" and tipo_inst == "Inst. Completa":
+            return "Verificare Tiro"
+        
+        # Altrimenti, raccogli gli errori
+        errors = []
+        if hasattr(device, 'error_message') and device.error_message:
+            errors.append(device.error_message)
+        if hasattr(device, 'api_error') and device.api_error:
+            errors.append(device.api_error)
+        if hasattr(device, 'mongodb_error') and device.mongodb_error:
+            errors.append(device.mongodb_error)
+        
+        return "; ".join(errors)[:50] if errors else ""
     
     def export_diagnostic_results(self, results: list, 
                                    output_path: Optional[str] = None) -> tuple[bool, str]:
@@ -270,6 +334,9 @@ class ResultExporter:
                 else:
                     mongo_status = getattr(r, 'mongodb_error', '-')[:20] if getattr(r, 'mongodb_error', '') else "-"
                 
+                # Genera la nota (con logica "Verificare Tiro")
+                note = self._get_note_for_device(r)
+                
                 data.append({
                     "Linea": r.linea,
                     "ST Sostegno": r.sostegno,
@@ -277,6 +344,7 @@ class ResultExporter:
                     "IP Address": r.ip_address,
                     "Vendor": r.vendor.value,
                     "Tipo": r.device_type.value,
+                    "Tipo Installazione AM": getattr(r, 'tipo_installazione_am', ''),
                     "Check MongoDB": mongo_status,
                     "Check LTE": "OK" if lte_ok else ("KO" if lte_ok is False else "0"),
                     "Check SSH": "OK" if ssh_ok else ("KO" if ssh_ok is False else "-"),
@@ -287,7 +355,7 @@ class ResultExporter:
                     "Segnale dBm": getattr(r, 'lte_signal_dbm', None) or "",
                     "Canale": getattr(r, 'channel', None) or "",
                     "Tipo Malfunzionamento": malfunction,
-                    "Note": r.error_message[:50] if hasattr(r, 'error_message') and r.error_message else "",
+                    "Note": note,
                     "Timestamp Test": r.test_timestamp if hasattr(r, 'test_timestamp') else ""
                 })
             
@@ -320,12 +388,21 @@ class ResultExporter:
                     'border': 1
                 })
                 
+                # Formato per "Verificare Tiro" (giallo/arancione)
+                verificare_tiro_format = workbook.add_format({
+                    'bg_color': '#FFEB9C',
+                    'font_color': '#9C6500',
+                    'border': 1,
+                    'bold': True
+                })
+                
                 for col_num, value in enumerate(df.columns.values):
                     worksheet.write(0, col_num, value, header_format)
                 
                 column_widths = {
                     'Linea': 10, 'ST Sostegno': 20, 'DeviceID': 28, 'IP Address': 14,
-                    'Vendor': 8, 'Tipo': 8, 'Check MongoDB': 12, 'Check LTE': 10,
+                    'Vendor': 8, 'Tipo': 8, 'Tipo Installazione AM': 18,
+                    'Check MongoDB': 12, 'Check LTE': 10,
                     'Check SSH': 10, 'Batteria': 9, 'Porta': 7, 'SOC %': 7, 'SOH %': 7,
                     'Segnale dBm': 11, 'Canale': 8, 'Tipo Malfunzionamento': 18, 
                     'Note': 30, 'Timestamp Test': 18
@@ -350,13 +427,27 @@ class ResultExporter:
                     'format': ko_format
                 })
                 
+                # Formattazione condizionale colonna Note per "Verificare Tiro"
+                note_col = df.columns.get_loc('Note')
+                worksheet.conditional_format(1, note_col, len(df), note_col, {
+                    'type': 'text',
+                    'criteria': 'containing',
+                    'value': 'Verificare Tiro',
+                    'format': verificare_tiro_format
+                })
+                
                 worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
                 worksheet.freeze_panes(1, 0)
                 
                 # Riepilogo
+                verificare_tiro_count = sum(1 for r in results 
+                                           if getattr(r, 'malfunction_type', '') == "OK" 
+                                           and getattr(r, 'tipo_installazione_am', '') == "Inst. Completa")
+                
                 summary_data = {
                     "Metrica": ["Totale Dispositivi", "OK", "Disconnesso", "Metriche assenti",
-                              "Allarme batteria", "Porta aperta", "Non classificato", "Data Test"],
+                              "Allarme batteria", "Porta aperta", "Non classificato", 
+                              "Da verificare Tiro", "Data Test"],
                     "Valore": [
                         len(results),
                         sum(1 for r in results if getattr(r, 'malfunction_type', '') == "OK"),
@@ -365,6 +456,7 @@ class ResultExporter:
                         sum(1 for r in results if getattr(r, 'malfunction_type', '') == "Allarme batteria"),
                         sum(1 for r in results if getattr(r, 'malfunction_type', '') == "Porta aperta"),
                         sum(1 for r in results if getattr(r, 'malfunction_type', '') == "Non classificato"),
+                        verificare_tiro_count,
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     ]
                 }

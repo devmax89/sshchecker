@@ -65,6 +65,9 @@ class DeviceInfo:
     device_type: DeviceType = DeviceType.UNKNOWN
     vendor: Vendor = Vendor.UNKNOWN
     
+    # Campo per "Tipo Installazione AM"
+    tipo_installazione_am: str = ""
+    
     # Risultati test SSH/Ping
     ping_status: ConnectionStatus = ConnectionStatus.PENDING
     ssh_status: ConnectionStatus = ConnectionStatus.PENDING
