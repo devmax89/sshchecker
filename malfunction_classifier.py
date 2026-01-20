@@ -18,6 +18,9 @@ class MalfunctionClassifier:
     - Disconnesso = SSH KO o LTE KO o non raggiungibile
     - Metriche assenti = Connesso ma MongoDB KO (non invia dati)
     - OK = Tutto funziona
+    
+    NOTA: Se OK e "Tipo Installazione AM" == "Inst. Completa" 
+          -> nelle Note viene scritto "Verificare Tiro" (gestito in data_handler.py)
     """
     
     def classify(self, device) -> str:
@@ -66,6 +69,8 @@ class MalfunctionClassifier:
                 return "Disconnesso"
         
         # 6. Tutto OK
+        # NOTA: Se OK e tipo_installazione_am == "Inst. Completa"
+        #       -> "Verificare Tiro" viene scritto nelle Note (gestito in data_handler.py)
         if ssh_ok and (mongodb_ok is True or mongodb_ok is None):
             if lte_ok is True or lte_ok is None:
                 if battery_ok is True or battery_ok is None:
@@ -120,6 +125,8 @@ REGOLE DI CLASSIFICAZIONE MALFUNZIONAMENTI:
 5. OK
    - Condizione: Tutti i check passati (SSH, LTE, MongoDB, Batteria)
    - Azione: Nessuna
+   - NOTA: Se "Tipo Installazione AM" = "Inst. Completa" 
+           -> Note: "Verificare Tiro"
 
 6. NON CLASSIFICATO
    - Condizione: Combinazione di stati non coperta dalle regole

@@ -267,27 +267,32 @@ class DiagnosticWorkerThread(QThread):
     """Thread worker per eseguire i test diagnostici completi"""
     
     progress_signal = pyqtSignal(object, str, int, int)  # device, message, current, total
-    completed_signal = pyqtSignal(list)  # results
+    completed_signal = pyqtSignal(list, dict)  # results, soc_data
     error_signal = pyqtSignal(str)  # error message
     bridge_status_signal = pyqtSignal(object, str)  # connected (bool/None), message
     phase_signal = pyqtSignal(str)  # current phase description
     
     def __init__(self, devices: list, max_workers: int = 10,
-                 check_ssh: bool = True, check_api: bool = True, check_mongodb: bool = True):
+                 check_ssh: bool = True, check_api: bool = True, 
+                 check_mongodb: bool = True, check_soc_history: bool = False,
+                 soc_days: int = 15):
         super().__init__()
         self.devices = devices
         self.max_workers = max_workers
         self.check_ssh = check_ssh
         self.check_api = check_api
         self.check_mongodb = check_mongodb
+        self.check_soc_history = check_soc_history
+        self.soc_days = soc_days
         self.checker: Optional[MultiThreadChecker] = None
         self._stop_requested = False
+        self.soc_data = {}  # {device_id: soc_history_dict}
         
     def run(self):
         try:
             # Fase 1: SSH/Ping
             if self.check_ssh:
-                self.phase_signal.emit("Fase 1/3: Check SSH/Ping...")
+                self.phase_signal.emit("Fase 1/4: Check SSH/Ping...")
                 self.checker = MultiThreadChecker(max_workers=self.max_workers)
                 
                 def on_progress(device, message, current, total):
@@ -306,20 +311,25 @@ class DiagnosticWorkerThread(QThread):
             
             # Fase 2: API Diagnostica
             if self.check_api and not self._stop_requested:
-                self.phase_signal.emit("Fase 2/3: API Diagnostica...")
+                self.phase_signal.emit("Fase 2/4: API Diagnostica...")
                 self._run_api_checks(results)
             
             # Fase 3: MongoDB
             if self.check_mongodb and not self._stop_requested:
-                self.phase_signal.emit("Fase 3/3: Check MongoDB 24h...")
+                self.phase_signal.emit("Fase 3/4: Check MongoDB 24h...")
                 self._run_mongodb_checks(results)
+            
+            # Fase 4: Storico SOC (opzionale)
+            if self.check_soc_history and not self._stop_requested:
+                self.phase_signal.emit(f"Fase 4/4: Storico SOC ({self.soc_days} giorni)...")
+                self._run_soc_history_checks(results)
             
             # Classificazione finale
             if not self._stop_requested:
                 self.phase_signal.emit("Classificazione malfunzionamenti...")
                 self._classify_malfunctions(results)
             
-            self.completed_signal.emit(results)
+            self.completed_signal.emit(results, self.soc_data)
             
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -365,7 +375,7 @@ class DiagnosticWorkerThread(QThread):
             tunnel_manager = get_tunnel_manager()
             
             # Avvia il tunnel SSH (una sola volta per tutti i device)
-            self.phase_signal.emit("Fase 3/3: Avvio tunnel SSH verso MongoDB...")
+            self.phase_signal.emit("Fase 3/4: Avvio tunnel SSH verso MongoDB...")
             success, msg, port = tunnel_manager.start_tunnel()
             
             if not success:
@@ -382,7 +392,7 @@ class DiagnosticWorkerThread(QThread):
                     device.mongodb_error = f"Connessione MongoDB fallita: {msg}"
                 return
             
-            self.phase_signal.emit("Fase 3/3: Check MongoDB 24h in corso...")
+            self.phase_signal.emit("Fase 3/4: Check MongoDB 24h in corso...")
             
             for i, device in enumerate(devices):
                 if self._stop_requested:
@@ -400,12 +410,63 @@ class DiagnosticWorkerThread(QThread):
                 except Exception as e:
                     device.mongodb_error = str(e)[:100]
             
-            # Chiudi connessione MongoDB (ma mantieni tunnel per eventuali altri usi)
-            mongo_checker.disconnect()
+            # NON chiudere la connessione se dobbiamo fare anche SOC history
+            if not self.check_soc_history:
+                mongo_checker.disconnect()
+            else:
+                # Salva il checker per riusarlo
+                self._mongo_checker = mongo_checker
                     
         except ImportError as e:
             for device in devices:
                 device.mongodb_error = f"Modulo non disponibile: {str(e)}"
+    
+    def _run_soc_history_checks(self, devices: list):
+        """Esegue l'analisi dello storico SOC per ogni dispositivo."""
+        try:
+            from mongodb_checker import MongoDBChecker, get_tunnel_manager
+            
+            # Riusa il checker se già connesso, altrimenti crea nuovo
+            if hasattr(self, '_mongo_checker') and self._mongo_checker:
+                mongo_checker = self._mongo_checker
+            else:
+                tunnel_manager = get_tunnel_manager()
+                
+                if not tunnel_manager.is_active():
+                    self.phase_signal.emit(f"Fase 4/4: Avvio tunnel SSH...")
+                    success, msg, port = tunnel_manager.start_tunnel()
+                    if not success:
+                        for device in devices:
+                            self.soc_data[device.device_id] = {"error": f"Tunnel fallito: {msg}"}
+                        return
+                
+                mongo_checker = MongoDBChecker(tunnel_manager)
+                success, msg = mongo_checker.connect()
+                if not success:
+                    for device in devices:
+                        self.soc_data[device.device_id] = {"error": f"Connessione fallita: {msg}"}
+                    return
+            
+            self.phase_signal.emit(f"Fase 4/4: Analisi SOC {self.soc_days} giorni...")
+            
+            for i, device in enumerate(devices):
+                if self._stop_requested:
+                    break
+                
+                self.progress_signal.emit(device, f"SOC history {i+1}/{len(devices)}...", i, len(devices))
+                
+                try:
+                    soc_result = mongo_checker.get_soc_history(device.device_id, days=self.soc_days)
+                    self.soc_data[device.device_id] = soc_result
+                except Exception as e:
+                    self.soc_data[device.device_id] = {"error": str(e)[:100]}
+            
+            # Chiudi connessione
+            mongo_checker.disconnect()
+            
+        except ImportError as e:
+            for device in devices:
+                self.soc_data[device.device_id] = {"error": f"Modulo non disponibile: {str(e)}"}
     
     def _classify_malfunctions(self, devices: list):
         """Classifica i malfunzionamenti per ogni dispositivo"""
@@ -466,6 +527,7 @@ class MainWindow(QMainWindow):
         self.result_exporter = ResultExporter()
         self.worker_thread: Optional[DiagnosticWorkerThread] = None
         self.results: list = []
+        self.soc_data: dict = {}  # Dati storico SOC per export
         
         self.init_ui()
         self.apply_style()
@@ -742,6 +804,11 @@ class MainWindow(QMainWindow):
         self.check_mongodb = QCheckBox("MongoDB (24h)")
         self.check_mongodb.setChecked(True)
         checks_row.addWidget(self.check_mongodb)
+        
+        self.check_soc_history = QCheckBox("Storico SOC")
+        self.check_soc_history.setChecked(False)
+        self.check_soc_history.setToolTip("Analizza storico SOC degli ultimi 15 giorni (richiede più tempo)")
+        checks_row.addWidget(self.check_soc_history)
         
         checks_layout.addLayout(checks_row)
         options_layout.addLayout(checks_layout, stretch=1)
@@ -1044,6 +1111,8 @@ class MainWindow(QMainWindow):
             checks.append("API Diagnostica")
         if self.check_mongodb.isChecked():
             checks.append("MongoDB 24h")
+        if self.check_soc_history.isChecked():
+            checks.append("Storico SOC 15gg")
         
         reply = QMessageBox.question(
             self,
@@ -1081,7 +1150,9 @@ class MainWindow(QMainWindow):
             self.threads_spin.value(),
             check_ssh=self.check_ssh.isChecked(),
             check_api=self.check_api.isChecked(),
-            check_mongodb=self.check_mongodb.isChecked()
+            check_mongodb=self.check_mongodb.isChecked(),
+            check_soc_history=self.check_soc_history.isChecked(),
+            soc_days=15
         )
         self.worker_thread.progress_signal.connect(self.on_progress)
         self.worker_thread.completed_signal.connect(self.on_completed)
@@ -1294,9 +1365,10 @@ class MainWindow(QMainWindow):
         self.stats_label.setText(f"OK: {ok_count} | KO: {ko_count} | In corso: {in_progress}")
         self.status_label.setText(f"{message[:50]}..." if len(message) > 50 else message)
     
-    def on_completed(self, results: list):
+    def on_completed(self, results: list, soc_data: dict = None):
         """Callback completamento"""
         self.results = results
+        self.soc_data = soc_data or {}  # Salva i dati SOC per l'export
         
         for device in results:
             self.update_device_in_table(device)
@@ -1348,7 +1420,12 @@ class MainWindow(QMainWindow):
         )
         
         if file_path:
-            success, result = self.result_exporter.export_diagnostic_results(self.results, file_path)
+            # Passa anche i dati SOC se disponibili
+            success, result = self.result_exporter.export_diagnostic_results(
+                self.results, 
+                file_path,
+                soc_data=self.soc_data if self.soc_data else None
+            )
             
             if success:
                 self.log(f"Risultati esportati: {result}", "SUCCESS")

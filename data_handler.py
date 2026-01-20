@@ -304,8 +304,15 @@ class ResultExporter:
         return "; ".join(errors)[:50] if errors else ""
     
     def export_diagnostic_results(self, results: list, 
-                                   output_path: Optional[str] = None) -> tuple[bool, str]:
-        """Esporta i risultati diagnostici in un file Excel."""
+                                   output_path: Optional[str] = None,
+                                   soc_data: Optional[dict] = None) -> tuple[bool, str]:
+        """Esporta i risultati diagnostici in un file Excel.
+        
+        Args:
+            results: Lista dei DeviceInfo con i risultati
+            output_path: Percorso del file di output (opzionale)
+            soc_data: Dict {device_id: soc_history} per lo sheet Storico SOC (opzionale)
+        """
         if not results:
             return False, "Nessun risultato da esportare"
         
@@ -328,7 +335,7 @@ class ResultExporter:
                 # MongoDB status
                 if mongodb_ok is True:
                     ts = getattr(r, 'mongodb_last_timestamp', None)
-                    mongo_status = ts.strftime("%d/%m/%Y") if ts else "Data"
+                    mongo_status = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "Data"
                 elif mongodb_ok is False:
                     mongo_status = "KO"
                 else:
@@ -345,7 +352,7 @@ class ResultExporter:
                     "Vendor": r.vendor.value,
                     "Tipo": r.device_type.value,
                     "Tipo Installazione AM": getattr(r, 'tipo_installazione_am', ''),
-                    "Check MongoDB": mongo_status,
+                    "Check MongoDB (24h)": mongo_status,
                     "Check LTE": "OK" if lte_ok else ("KO" if lte_ok is False else "0"),
                     "Check SSH": "OK" if ssh_ok else ("KO" if ssh_ok is False else "-"),
                     "Batteria": "OK" if battery_ok else ("KO" if battery_ok is False else "-"),
@@ -403,7 +410,7 @@ class ResultExporter:
                 column_widths = {
                     'Linea': 10, 'ST Sostegno': 20, 'DeviceID': 28, 'IP Address': 14,
                     'Vendor': 8, 'Tipo': 8, 'Tipo Installazione AM': 18,
-                    'Check MongoDB (24h)': 12, 'Check LTE': 10,
+                    'Check MongoDB (24h)': 18, 'Check LTE': 10,
                     'Check SSH': 10, 'Batteria': 9, 'Porta': 7, 'SOC %': 7, 'SOH %': 7,
                     'Segnale dBm': 11, 'Canale': 8, 'API Timestamp': 18,
                     'Tipo Malfunzionamento': 18, 
@@ -471,11 +478,182 @@ class ResultExporter:
                     ws_summary.write(0, col_num, value, header_format)
                 ws_summary.set_column(0, 0, 25)
                 ws_summary.set_column(1, 1, 20)
+                
+                # Aggiungi sheet Storico SOC se ci sono dati
+                if soc_data:
+                    self.export_soc_history_sheet(writer, workbook, results, soc_data, days=15)
             
             return True, str(output_path)
             
         except Exception as e:
             return False, f"Errore esportazione: {str(e)}"
+    
+    def export_soc_history_sheet(self, writer, workbook, results: list, soc_data: dict, days: int = 15):
+        """
+        Aggiunge lo sheet "Storico SOC" al file Excel.
+        
+        Args:
+            writer: ExcelWriter attivo
+            workbook: Workbook xlsxwriter
+            results: Lista dei DeviceInfo
+            soc_data: Dict {device_id: soc_history_dict} con i dati SOC
+            days: Numero di giorni analizzati
+        """
+        from datetime import datetime, timedelta
+        
+        # Genera le date degli ultimi N giorni
+        today = datetime.now().date()
+        date_columns = []
+        for i in range(days):
+            d = today - timedelta(days=i)
+            date_columns.append(d.strftime("%Y-%m-%d"))
+        
+        # Costruisci i dati
+        data = []
+        for r in results:
+            device_soc = soc_data.get(r.device_id, {})
+            daily_soc = device_soc.get("daily_soc", {})
+            
+            row = {
+                "DeviceID": r.device_id,
+                "Linea": r.linea,
+                "Sostegno": r.sostegno,
+                "Vendor": r.vendor.value,
+                "Tipo": r.device_type.value,
+            }
+            
+            # Aggiungi colonne per ogni giorno
+            for date_str in date_columns:
+                row[date_str] = daily_soc.get(date_str, "")
+            
+            # Statistiche
+            row["Media"] = device_soc.get("avg", "")
+            row["Min"] = device_soc.get("min", "")
+            row["Max"] = device_soc.get("max", "")
+            row["Trend"] = device_soc.get("trend", "")
+            
+            if device_soc.get("error"):
+                row["Errore"] = device_soc.get("error", "")[:30]
+            else:
+                row["Errore"] = ""
+            
+            data.append(row)
+        
+        import pandas as pd
+        df_soc = pd.DataFrame(data)
+        df_soc.to_excel(writer, index=False, sheet_name='Storico SOC')
+        
+        # Formattazione
+        worksheet = writer.sheets['Storico SOC']
+        
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#0066CC',
+            'font_color': 'white',
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter'
+        })
+        
+        # Formati condizionali per SOC
+        low_soc_format = workbook.add_format({
+            'bg_color': '#FFC7CE',
+            'font_color': '#9C0006',
+            'border': 1
+        })
+        
+        medium_soc_format = workbook.add_format({
+            'bg_color': '#FFEB9C',
+            'font_color': '#9C6500',
+            'border': 1
+        })
+        
+        high_soc_format = workbook.add_format({
+            'bg_color': '#C6EFCE',
+            'font_color': '#006100',
+            'border': 1
+        })
+        
+        trend_up_format = workbook.add_format({
+            'bg_color': '#C6EFCE',
+            'font_color': '#006100',
+            'bold': True,
+            'align': 'center'
+        })
+        
+        trend_down_format = workbook.add_format({
+            'bg_color': '#FFC7CE',
+            'font_color': '#9C0006',
+            'bold': True,
+            'align': 'center'
+        })
+        
+        # Scrivi header
+        for col_num, value in enumerate(df_soc.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+        
+        # Imposta larghezze colonne
+        worksheet.set_column(0, 0, 28)  # DeviceID
+        worksheet.set_column(1, 1, 10)  # Linea
+        worksheet.set_column(2, 2, 18)  # Sostegno
+        worksheet.set_column(3, 3, 8)   # Vendor
+        worksheet.set_column(4, 4, 8)   # Tipo
+        
+        # Colonne date (più strette)
+        date_start_col = 5
+        date_end_col = date_start_col + days - 1
+        for col in range(date_start_col, date_end_col + 1):
+            worksheet.set_column(col, col, 11)
+        
+        # Colonne statistiche
+        stats_start_col = date_end_col + 1
+        worksheet.set_column(stats_start_col, stats_start_col, 7)      # Media
+        worksheet.set_column(stats_start_col + 1, stats_start_col + 1, 5)  # Min
+        worksheet.set_column(stats_start_col + 2, stats_start_col + 2, 5)  # Max
+        worksheet.set_column(stats_start_col + 3, stats_start_col + 3, 6)  # Trend
+        worksheet.set_column(stats_start_col + 4, stats_start_col + 4, 25) # Errore
+        
+        # Formattazione condizionale per le colonne SOC (valori numerici)
+        # SOC < 30 = rosso, 30-60 = giallo, > 60 = verde
+        for col in range(date_start_col, date_end_col + 1):
+            worksheet.conditional_format(1, col, len(df_soc), col, {
+                'type': 'cell',
+                'criteria': '<',
+                'value': 30,
+                'format': low_soc_format
+            })
+            worksheet.conditional_format(1, col, len(df_soc), col, {
+                'type': 'cell',
+                'criteria': 'between',
+                'minimum': 30,
+                'maximum': 60,
+                'format': medium_soc_format
+            })
+            worksheet.conditional_format(1, col, len(df_soc), col, {
+                'type': 'cell',
+                'criteria': '>',
+                'value': 60,
+                'format': high_soc_format
+            })
+        
+        # Formattazione condizionale per Trend
+        trend_col = stats_start_col + 3
+        worksheet.conditional_format(1, trend_col, len(df_soc), trend_col, {
+            'type': 'text',
+            'criteria': 'containing',
+            'value': '↑',
+            'format': trend_up_format
+        })
+        worksheet.conditional_format(1, trend_col, len(df_soc), trend_col, {
+            'type': 'text',
+            'criteria': 'containing',
+            'value': '↓',
+            'format': trend_down_format
+        })
+        
+        # Freeze panes e autofilter
+        worksheet.freeze_panes(1, 0)
+        worksheet.autofilter(0, 0, len(df_soc), len(df_soc.columns) - 1)
     
     def export_results(self, results: list, output_path: Optional[str] = None) -> tuple[bool, str]:
         """Alias per compatibilità con vecchia versione"""

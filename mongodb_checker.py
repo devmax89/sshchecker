@@ -299,6 +299,137 @@ class MongoDBChecker:
         
         return result
     
+    def get_soc_history(self, device_id: str, days: int = 15) -> dict:
+        """
+        Recupera lo storico SOC (State of Charge) per un dispositivo.
+        Prende un valore per giorno (l'ultimo disponibile).
+        
+        Args:
+            device_id: Il clientId del dispositivo
+            days: Numero di giorni da analizzare (default 15)
+            
+        Returns:
+            Dict con:
+                - device_id: str
+                - daily_soc: dict {date_str: soc_value} es: {"2026-01-19": 99, "2026-01-18": 98}
+                - avg: float (media)
+                - min: int (minimo)
+                - max: int (massimo)
+                - trend: str ("↑", "↓", "→")
+                - error: str (eventuale errore)
+        """
+        result = {
+            "device_id": device_id,
+            "daily_soc": {},
+            "avg": None,
+            "min": None,
+            "max": None,
+            "trend": "",
+            "error": ""
+        }
+        
+        # Verifica connessione
+        if self._collection is None:
+            success, msg = self.connect()
+            if not success:
+                result["error"] = msg
+                return result
+        
+        try:
+            now = datetime.now()
+            start_date = now - timedelta(days=days)
+            start_ms = int(start_date.timestamp() * 1000)
+            end_ms = int(now.timestamp() * 1000)
+            
+            # Query per ottenere tutti i documenti nel periodo
+            # Raggruppa per giorno e prendi l'ultimo valore
+            pipeline = [
+                {
+                    "$match": {
+                        "clientId": device_id,
+                        "payload.metrics.TIMESTAMP.value": {
+                            "$gte": start_ms,
+                            "$lte": end_ms
+                        },
+                        "payload.metrics.EGM_OUT_SENS_23_VAR_3_value.value": {"$exists": True}
+                    }
+                },
+                {
+                    "$addFields": {
+                        "timestamp_date": {
+                            "$toDate": "$payload.metrics.TIMESTAMP.value"
+                        },
+                        "soc_value": "$payload.metrics.EGM_OUT_SENS_23_VAR_3_value.value"
+                    }
+                },
+                {
+                    "$addFields": {
+                        "day_str": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d",
+                                "date": "$timestamp_date"
+                            }
+                        }
+                    }
+                },
+                {
+                    "$sort": {"payload.metrics.TIMESTAMP.value": -1}
+                },
+                {
+                    "$group": {
+                        "_id": "$day_str",
+                        "soc": {"$first": "$soc_value"},
+                        "timestamp": {"$first": "$payload.metrics.TIMESTAMP.value"}
+                    }
+                },
+                {
+                    "$sort": {"_id": -1}  # Ordina per data decrescente
+                }
+            ]
+            
+            docs = list(self._collection.aggregate(pipeline))
+            
+            if docs:
+                # Popola daily_soc
+                soc_values = []
+                for doc in docs:
+                    date_str = doc["_id"]
+                    soc = doc["soc"]
+                    
+                    # Gestisci il caso in cui soc sia un dict con $numberLong
+                    if isinstance(soc, dict) and "$numberLong" in soc:
+                        soc = int(soc["$numberLong"])
+                    elif isinstance(soc, (int, float)):
+                        soc = int(soc)
+                    else:
+                        continue
+                    
+                    result["daily_soc"][date_str] = soc
+                    soc_values.append(soc)
+                
+                if soc_values:
+                    result["avg"] = round(sum(soc_values) / len(soc_values), 1)
+                    result["min"] = min(soc_values)
+                    result["max"] = max(soc_values)
+                    
+                    # Calcola trend (confronta primo e ultimo valore disponibile)
+                    # soc_values[0] è il più recente, soc_values[-1] è il più vecchio
+                    if len(soc_values) >= 2:
+                        diff = soc_values[0] - soc_values[-1]
+                        if diff > 2:
+                            result["trend"] = "↑"
+                        elif diff < -2:
+                            result["trend"] = "↓"
+                        else:
+                            result["trend"] = "→"
+                    else:
+                        result["trend"] = "→"
+            
+        except Exception as e:
+            result["error"] = str(e)[:150]
+        
+        return result
+    
     def check_devices_batch(self, device_ids: list, 
                             progress_callback=None) -> list[MongoCheckResult]:
         """
@@ -367,6 +498,14 @@ if __name__ == "__main__":
             print(f"Has data 24h: {result.has_data_24h}")
             print(f"Last timestamp: {result.last_timestamp}")
             print(f"Error: {result.error}")
+            
+            # Test SOC history
+            print(f"\n--- Test SOC History ---")
+            soc_history = checker.get_soc_history(test_device, days=15)
+            print(f"Daily SOC: {soc_history['daily_soc']}")
+            print(f"Avg: {soc_history['avg']}, Min: {soc_history['min']}, Max: {soc_history['max']}")
+            print(f"Trend: {soc_history['trend']}")
+            print(f"Error: {soc_history['error']}")
             
             checker.disconnect()
         
