@@ -170,8 +170,10 @@ class MongoDBChecker:
         self.mongo_uri = os.getenv("MONGO_URI", "")
         self.database = os.getenv("MONGO_DATABASE", "ibm_iot")
         self.collection_name = os.getenv("MONGO_COLLECTION", "event")
+        self.collection_diags_name = os.getenv("MONGO_COLLECTION_DIAGS", "diagnostics")
         self._client = None
         self._collection = None
+        self._collection_diags = None
         
     def connect(self) -> tuple[bool, str]:
         """
@@ -215,6 +217,7 @@ class MongoDBChecker:
             
             db = self._client[self.database]
             self._collection = db[self.collection_name]
+            self._collection_diags = db[self.collection_diags_name]
             
             return True, "Connesso a MongoDB via tunnel SSH"
             
@@ -328,8 +331,8 @@ class MongoDBChecker:
             "error": ""
         }
         
-        # Verifica connessione
-        if self._collection is None:
+        # Verifica connessione - usa collection diagnostics
+        if self._collection_diags is None:
             success, msg = self.connect()
             if not success:
                 result["error"] = msg
@@ -387,7 +390,7 @@ class MongoDBChecker:
                 }
             ]
             
-            docs = list(self._collection.aggregate(pipeline))
+            docs = list(self._collection_diags.aggregate(pipeline))
             
             if docs:
                 # Popola daily_soc
@@ -459,8 +462,8 @@ class MongoDBChecker:
             "error": ""
         }
         
-        # Verifica connessione
-        if self._collection is None:
+        # Verifica connessione - usa collection diagnostics
+        if self._collection_diags is None:
             success, msg = self.connect()
             if not success:
                 result["error"] = msg
@@ -471,6 +474,46 @@ class MongoDBChecker:
             start_time = now - timedelta(hours=hours)
             start_ms = int(start_time.timestamp() * 1000)
             end_ms = int(now.timestamp() * 1000)
+            
+            # Prima verifica: conta quanti documenti esistono per questo device nel periodo
+            # senza il filtro sulla metrica canale (usa collection diagnostics)
+            count_pipeline = [
+                {
+                    "$match": {
+                        "clientId": device_id,
+                        "payload.metrics.TIMESTAMP.value": {
+                            "$gte": start_ms,
+                            "$lte": end_ms
+                        }
+                    }
+                },
+                {"$count": "total"}
+            ]
+            
+            count_result = list(self._collection_diags.aggregate(count_pipeline))
+            total_docs = count_result[0]["total"] if count_result else 0
+            
+            if total_docs == 0:
+                result["error"] = f"Nessun documento in diagnostics nelle ultime {hours}h"
+                return result
+            
+            # Conta quanti documenti hanno la metrica canale
+            count_channel_pipeline = [
+                {
+                    "$match": {
+                        "clientId": device_id,
+                        "payload.metrics.TIMESTAMP.value": {
+                            "$gte": start_ms,
+                            "$lte": end_ms
+                        },
+                        "payload.metrics.EGM_OUT_SENS_23_VAR_7_value.value": {"$exists": True}
+                    }
+                },
+                {"$count": "total"}
+            ]
+            
+            count_channel_result = list(self._collection_diags.aggregate(count_channel_pipeline))
+            docs_with_channel = count_channel_result[0]["total"] if count_channel_result else 0
             
             # Query per ottenere tutti i documenti nel periodo
             # Raggruppa per ora e prendi l'ultimo valore
@@ -518,7 +561,7 @@ class MongoDBChecker:
                 }
             ]
             
-            docs = list(self._collection.aggregate(pipeline))
+            docs = list(self._collection_diags.aggregate(pipeline))
             
             if docs:
                 channels_set = set()
@@ -551,6 +594,9 @@ class MongoDBChecker:
                 result["lte_count"] = lte_count
                 result["nbiot_count"] = nbiot_count
                 result["lora_count"] = lora_count
+            else:
+                # Documenti esistono ma la metrica canale no
+                result["error"] = f"{total_docs} doc, {docs_with_channel} con canale"
             
         except Exception as e:
             result["error"] = str(e)[:150]
