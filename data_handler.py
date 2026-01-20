@@ -280,19 +280,32 @@ class ResultExporter:
         """
         Genera la nota per un dispositivo.
         
-        Logica:
-        - Se malfunction_type == "OK" E tipo_installazione_am == "Inst. Completa"
-          -> "Verificare Tiro"
-        - Altrimenti mostra eventuali errori
+        Logica (in ordine di priorità):
+        1. Se malfunction_type == "OK" E tipo_installazione_am == "Inst. Completa"
+           -> "Verificare Tiro"
+        2. Se c'è connectivity_note (es: "Non raggiungibile (Ping KO, SSH KO)")
+           -> Mostra la connectivity_note
+        3. Altrimenti mostra eventuali errori tecnici
         """
-        # Controlla la condizione speciale per "Verificare Tiro"
         malfunction = getattr(device, 'malfunction_type', '')
         tipo_inst = getattr(device, 'tipo_installazione_am', '')
+        connectivity_note = getattr(device, 'connectivity_note', '')
         
+        notes = []
+        
+        # 1. Verificare Tiro (priorità alta)
         if malfunction == "OK" and tipo_inst == "Inst. Completa":
-            return "Verificare Tiro"
+            notes.append("Verificare Tiro")
         
-        # Altrimenti, raccogli gli errori
+        # 2. Connectivity note (se presente)
+        if connectivity_note:
+            notes.append(connectivity_note)
+        
+        # Se abbiamo già delle note, restituiscile
+        if notes:
+            return "; ".join(notes)
+        
+        # 3. Altrimenti, raccogli gli errori tecnici
         errors = []
         if hasattr(device, 'error_message') and device.error_message:
             errors.append(device.error_message)
@@ -305,13 +318,15 @@ class ResultExporter:
     
     def export_diagnostic_results(self, results: list, 
                                    output_path: Optional[str] = None,
-                                   soc_data: Optional[dict] = None) -> tuple[bool, str]:
+                                   soc_data: Optional[dict] = None,
+                                   channel_data: Optional[dict] = None) -> tuple[bool, str]:
         """Esporta i risultati diagnostici in un file Excel.
         
         Args:
             results: Lista dei DeviceInfo con i risultati
             output_path: Percorso del file di output (opzionale)
             soc_data: Dict {device_id: soc_history} per lo sheet Storico SOC (opzionale)
+            channel_data: Dict {device_id: channel_history} per lo sheet Storico Canale (opzionale)
         """
         if not results:
             return False, "Nessun risultato da esportare"
@@ -481,7 +496,17 @@ class ResultExporter:
                 
                 # Aggiungi sheet Storico SOC se ci sono dati
                 if soc_data:
+                    print(f"DEBUG: soc_data ha {len(soc_data)} dispositivi")
                     self.export_soc_history_sheet(writer, workbook, results, soc_data, days=15)
+                else:
+                    print("DEBUG: soc_data è vuoto o None")
+                
+                # Aggiungi sheet Storico Canale se ci sono dati
+                if channel_data:
+                    print(f"DEBUG: channel_data ha {len(channel_data)} dispositivi")
+                    self.export_channel_history_sheet(writer, workbook, results, channel_data, hours=24)
+                else:
+                    print("DEBUG: channel_data è vuoto o None")
             
             return True, str(output_path)
             
@@ -654,6 +679,156 @@ class ResultExporter:
         # Freeze panes e autofilter
         worksheet.freeze_panes(1, 0)
         worksheet.autofilter(0, 0, len(df_soc), len(df_soc.columns) - 1)
+    
+    def export_channel_history_sheet(self, writer, workbook, results: list, channel_data: dict, hours: int = 24):
+        """
+        Aggiunge lo sheet "Storico Canale" al file Excel.
+        
+        Args:
+            writer: ExcelWriter attivo
+            workbook: Workbook xlsxwriter
+            results: Lista dei DeviceInfo
+            channel_data: Dict {device_id: channel_history_dict} con i dati canale
+            hours: Numero di ore analizzate
+        """
+        from datetime import datetime, timedelta
+        
+        # Genera le ore delle ultime N ore
+        now = datetime.now()
+        hour_columns = []
+        for i in range(hours):
+            h = now - timedelta(hours=i)
+            hour_columns.append(h.strftime("%Y-%m-%d %H:00"))
+        
+        # Costruisci i dati
+        data = []
+        for r in results:
+            device_channel = channel_data.get(r.device_id, {})
+            hourly_channel = device_channel.get("hourly_channel", {})
+            
+            row = {
+                "DeviceID": r.device_id,
+                "Linea": r.linea,
+                "Sostegno": r.sostegno,
+                "Vendor": r.vendor.value,
+                "Tipo": r.device_type.value,
+            }
+            
+            # Aggiungi colonne per ogni ora
+            for hour_str in hour_columns:
+                row[hour_str] = hourly_channel.get(hour_str, "")
+            
+            # Statistiche
+            row["LTE"] = device_channel.get("lte_count", "")
+            row["NBIoT"] = device_channel.get("nbiot_count", "")
+            row["LORA"] = device_channel.get("lora_count", "")
+            row["Canali Usati"] = ", ".join(device_channel.get("channels_used", []))
+            
+            if device_channel.get("error"):
+                row["Errore"] = device_channel.get("error", "")[:30]
+            else:
+                row["Errore"] = ""
+            
+            data.append(row)
+        
+        import pandas as pd
+        df_channel = pd.DataFrame(data)
+        df_channel.to_excel(writer, index=False, sheet_name='Storico Canale')
+        
+        # Formattazione
+        worksheet = writer.sheets['Storico Canale']
+        
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#0066CC',
+            'font_color': 'white',
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter'
+        })
+        
+        # Formati per canale
+        lte_format = workbook.add_format({
+            'bg_color': '#C6EFCE',
+            'font_color': '#006100',
+            'border': 1,
+            'align': 'center'
+        })
+        
+        # NBIoT = BLU
+        nbiot_format = workbook.add_format({
+            'bg_color': '#CCE5FF',  
+            'font_color': '#004C99', 
+            'border': 1,
+            'align': 'center'
+        })
+        
+        # LORA = GIALLO
+        lora_format = workbook.add_format({
+            'bg_color': '#FFEB9C',   
+            'font_color': '#9C6500', 
+            'border': 1,
+            'align': 'center'
+        })
+        
+        # Scrivi header
+        for col_num, value in enumerate(df_channel.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+        
+        # Imposta larghezze colonne
+        worksheet.set_column(0, 0, 28)  # DeviceID
+        worksheet.set_column(1, 1, 10)  # Linea
+        worksheet.set_column(2, 2, 18)  # Sostegno
+        worksheet.set_column(3, 3, 8)   # Vendor
+        worksheet.set_column(4, 4, 8)   # Tipo
+        
+        # Colonne ore (più strette)
+        hour_start_col = 5
+        hour_end_col = hour_start_col + hours - 1
+        for col in range(hour_start_col, hour_end_col + 1):
+            worksheet.set_column(col, col, 15)
+        
+        # Colonne statistiche
+        stats_start_col = hour_end_col + 1
+        worksheet.set_column(stats_start_col, stats_start_col, 5)      # LTE
+        worksheet.set_column(stats_start_col + 1, stats_start_col + 1, 6)  # NBIoT
+        worksheet.set_column(stats_start_col + 2, stats_start_col + 2, 6)  # LORA
+        worksheet.set_column(stats_start_col + 3, stats_start_col + 3, 15) # Canali Usati
+        worksheet.set_column(stats_start_col + 4, stats_start_col + 4, 25) # Errore
+        
+        # Formattazione condizionale per le colonne canale
+        for col in range(hour_start_col, hour_end_col + 1):
+            # LTE = verde
+            worksheet.conditional_format(1, col, len(df_channel), col, {
+                'type': 'text',
+                'criteria': 'containing',
+                'value': 'LTE',
+                'format': lte_format
+            })
+            # NBIOT = blu
+            worksheet.conditional_format(1, col, len(df_channel), col, {
+                'type': 'text',
+                'criteria': 'containing',
+                'value': 'NBIOT',
+                'format': nbiot_format
+            })
+            worksheet.conditional_format(1, col, len(df_channel), col, {
+                'type': 'text',
+                'criteria': 'containing',
+                'value': 'NB-IOT',
+                'format': nbiot_format
+            })
+            # LORA = giallo
+            worksheet.conditional_format(1, col, len(df_channel), col, {
+                'type': 'text',
+                'criteria': 'containing',
+                'value': 'LORA',
+                'format': lora_format
+            })
+        
+        # Freeze panes e autofilter
+        worksheet.freeze_panes(1, 0)
+        worksheet.autofilter(0, 0, len(df_channel), len(df_channel.columns) - 1)
     
     def export_results(self, results: list, output_path: Optional[str] = None) -> tuple[bool, str]:
         """Alias per compatibilità con vecchia versione"""

@@ -430,6 +430,133 @@ class MongoDBChecker:
         
         return result
     
+    def get_channel_history(self, device_id: str, hours: int = 24) -> dict:
+        """
+        Recupera lo storico del canale di trasmissione per un dispositivo.
+        Prende un valore per ora (l'ultimo disponibile).
+        
+        Args:
+            device_id: Il clientId del dispositivo
+            hours: Numero di ore da analizzare (default 24)
+            
+        Returns:
+            Dict con:
+                - device_id: str
+                - hourly_channel: dict {hour_str: channel_value} es: {"2026-01-20 14:00": "LTE", "2026-01-20 13:00": "NBIoT"}
+                - channels_used: list dei canali unici utilizzati
+                - lte_count: int (conteggio ore su LTE)
+                - nbiot_count: int (conteggio ore su NBIoT)
+                - lora_count: int (conteggio ore su LORA)
+                - error: str (eventuale errore)
+        """
+        result = {
+            "device_id": device_id,
+            "hourly_channel": {},
+            "channels_used": [],
+            "lte_count": 0,
+            "nbiot_count": 0,
+            "lora_count": 0,
+            "error": ""
+        }
+        
+        # Verifica connessione
+        if self._collection is None:
+            success, msg = self.connect()
+            if not success:
+                result["error"] = msg
+                return result
+        
+        try:
+            now = datetime.now()
+            start_time = now - timedelta(hours=hours)
+            start_ms = int(start_time.timestamp() * 1000)
+            end_ms = int(now.timestamp() * 1000)
+            
+            # Query per ottenere tutti i documenti nel periodo
+            # Raggruppa per ora e prendi l'ultimo valore
+            pipeline = [
+                {
+                    "$match": {
+                        "clientId": device_id,
+                        "payload.metrics.TIMESTAMP.value": {
+                            "$gte": start_ms,
+                            "$lte": end_ms
+                        },
+                        "payload.metrics.EGM_OUT_SENS_23_VAR_7_value.value": {"$exists": True}
+                    }
+                },
+                {
+                    "$addFields": {
+                        "timestamp_date": {
+                            "$toDate": "$payload.metrics.TIMESTAMP.value"
+                        },
+                        "channel_value": "$payload.metrics.EGM_OUT_SENS_23_VAR_7_value.value"
+                    }
+                },
+                {
+                    "$addFields": {
+                        "hour_str": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d %H:00",
+                                "date": "$timestamp_date"
+                            }
+                        }
+                    }
+                },
+                {
+                    "$sort": {"payload.metrics.TIMESTAMP.value": -1}
+                },
+                {
+                    "$group": {
+                        "_id": "$hour_str",
+                        "channel": {"$first": "$channel_value"},
+                        "timestamp": {"$first": "$payload.metrics.TIMESTAMP.value"}
+                    }
+                },
+                {
+                    "$sort": {"_id": -1}  # Ordina per ora decrescente
+                }
+            ]
+            
+            docs = list(self._collection.aggregate(pipeline))
+            
+            if docs:
+                channels_set = set()
+                lte_count = 0
+                nbiot_count = 0
+                lora_count = 0
+                
+                for doc in docs:
+                    hour_str = doc["_id"]
+                    channel = doc["channel"]
+                    
+                    # Il valore dovrebbe essere una stringa
+                    if isinstance(channel, str):
+                        channel = channel.strip().upper()
+                    else:
+                        channel = str(channel).strip().upper()
+                    
+                    result["hourly_channel"][hour_str] = channel
+                    channels_set.add(channel)
+                    
+                    # Conteggio per tipo
+                    if "LTE" in channel:
+                        lte_count += 1
+                    elif "NBIOT" in channel or "NB-IOT" in channel or "NB_IOT" in channel:
+                        nbiot_count += 1
+                    elif "LORA" in channel:
+                        lora_count += 1
+                
+                result["channels_used"] = sorted(list(channels_set))
+                result["lte_count"] = lte_count
+                result["nbiot_count"] = nbiot_count
+                result["lora_count"] = lora_count
+            
+        except Exception as e:
+            result["error"] = str(e)[:150]
+        
+        return result
+    
     def check_devices_batch(self, device_ids: list, 
                             progress_callback=None) -> list[MongoCheckResult]:
         """

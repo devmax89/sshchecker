@@ -95,6 +95,7 @@ class DeviceInfo:
     
     # Classificazione malfunzionamento
     malfunction_type: str = ""
+    connectivity_note: str = ""  # Nota sulla raggiungibilità (es: "Ping KO, SSH KO")
 
 
 def detect_device_type(device_id: str) -> DeviceType:
@@ -244,8 +245,8 @@ class BridgeConnection:
 class DeviceChecker:
     """Classe per verificare la connettività di un singolo dispositivo"""
     
-    MASTER_PING_RETRY_TIMEOUT = 300
-    SLAVE_PING_RETRY_TIMEOUT = 1200
+    MASTER_PING_RETRY_TIMEOUT = 900   # 15 minuti per Master
+    SLAVE_PING_RETRY_TIMEOUT = 2100   # 35 minuti per Slave
     PING_RETRY_INTERVAL = 10
     SSH_RETRY_ATTEMPTS = 5
     SSH_RETRY_INTERVAL = 2
