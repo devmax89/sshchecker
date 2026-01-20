@@ -267,7 +267,7 @@ class DiagnosticWorkerThread(QThread):
     """Thread worker per eseguire i test diagnostici completi"""
     
     progress_signal = pyqtSignal(object, str, int, int)  # device, message, current, total
-    completed_signal = pyqtSignal(list, dict, dict)  # results, soc_data, channel_data
+    completed_signal = pyqtSignal(list, dict, dict, dict)  # results, soc_data, channel_data, signal_data
     error_signal = pyqtSignal(str)  # error message
     bridge_status_signal = pyqtSignal(object, str)  # connected (bool/None), message
     phase_signal = pyqtSignal(str)  # current phase description
@@ -275,8 +275,8 @@ class DiagnosticWorkerThread(QThread):
     def __init__(self, devices: list, max_workers: int = 10,
                  check_ssh: bool = True, check_api: bool = True, 
                  check_mongodb: bool = True, check_soc_history: bool = False,
-                 check_channel_history: bool = False,
-                 soc_days: int = 15, channel_hours: int = 24):
+                 check_channel_history: bool = False, check_signal_history: bool = False,
+                 soc_days: int = 15, channel_hours: int = 24, signal_hours: int = 24):
         super().__init__()
         self.devices = devices
         self.max_workers = max_workers
@@ -285,12 +285,15 @@ class DiagnosticWorkerThread(QThread):
         self.check_mongodb = check_mongodb
         self.check_soc_history = check_soc_history
         self.check_channel_history = check_channel_history
+        self.check_signal_history = check_signal_history
         self.soc_days = soc_days
         self.channel_hours = channel_hours
+        self.signal_hours = signal_hours
         self.checker: Optional[MultiThreadChecker] = None
         self._stop_requested = False
         self.soc_data = {}  # {device_id: soc_history_dict}
         self.channel_data = {}  # {device_id: channel_history_dict}
+        self.signal_data = {}  # {device_id: signal_history_dict}
         
     def run(self):
         try:
@@ -300,6 +303,7 @@ class DiagnosticWorkerThread(QThread):
             if self.check_mongodb: total_phases += 1
             if self.check_soc_history: total_phases += 1
             if self.check_channel_history: total_phases += 1
+            if self.check_signal_history: total_phases += 1
             current_phase = 0
             
             # Fase 1: SSH/Ping
@@ -346,12 +350,18 @@ class DiagnosticWorkerThread(QThread):
                 self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: Storico Canale ({self.channel_hours}h)...")
                 self._run_channel_history_checks(results)
             
+            # Fase 6: Storico Segnale (opzionale)
+            if self.check_signal_history and not self._stop_requested:
+                current_phase += 1
+                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: Storico Segnale ({self.signal_hours}h)...")
+                self._run_signal_history_checks(results)
+            
             # Classificazione finale
             if not self._stop_requested:
                 self.phase_signal.emit("Classificazione malfunzionamenti...")
                 self._classify_malfunctions(results)
             
-            self.completed_signal.emit(results, self.soc_data, self.channel_data)
+            self.completed_signal.emit(results, self.soc_data, self.channel_data, self.signal_data)
             
         except Exception as e:
             self.error_signal.emit(str(e))
@@ -531,6 +541,47 @@ class DiagnosticWorkerThread(QThread):
             for device in devices:
                 self.channel_data[device.device_id] = {"error": f"Modulo non disponibile: {str(e)}"}
     
+    def _run_signal_history_checks(self, devices: list):
+        """Esegue l'analisi dello storico segnale LTE per ogni dispositivo."""
+        try:
+            from mongodb_checker import MongoDBChecker, get_tunnel_manager
+            
+            tunnel_manager = get_tunnel_manager()
+            
+            if not tunnel_manager.is_active():
+                self.phase_signal.emit(f"Avvio tunnel SSH per storico segnale...")
+                success, msg, port = tunnel_manager.start_tunnel()
+                if not success:
+                    for device in devices:
+                        self.signal_data[device.device_id] = {"error": f"Tunnel fallito: {msg}"}
+                    return
+            
+            mongo_checker = MongoDBChecker(tunnel_manager)
+            success, msg = mongo_checker.connect()
+            if not success:
+                for device in devices:
+                    self.signal_data[device.device_id] = {"error": f"Connessione fallita: {msg}"}
+                return
+            
+            for i, device in enumerate(devices):
+                if self._stop_requested:
+                    break
+                
+                self.progress_signal.emit(device, f"Signal history {i+1}/{len(devices)}...", i, len(devices))
+                
+                try:
+                    signal_result = mongo_checker.get_signal_history(device.device_id, hours=self.signal_hours)
+                    self.signal_data[device.device_id] = signal_result
+                except Exception as e:
+                    self.signal_data[device.device_id] = {"error": str(e)[:100]}
+            
+            # Chiudi connessione
+            mongo_checker.disconnect()
+            
+        except ImportError as e:
+            for device in devices:
+                self.signal_data[device.device_id] = {"error": f"Modulo non disponibile: {str(e)}"}
+    
     def _classify_malfunctions(self, devices: list):
         """Classifica i malfunzionamenti per ogni dispositivo"""
         try:
@@ -595,6 +646,7 @@ class MainWindow(QMainWindow):
         self.results: list = []
         self.soc_data: dict = {}  # Dati storico SOC per export
         self.channel_data: dict = {}  # Dati storico canale per export
+        self.signal_data: dict = {}  # Dati storico segnale per export
         
         self.init_ui()
         self.apply_style()
@@ -881,6 +933,11 @@ class MainWindow(QMainWindow):
         self.check_channel_history.setChecked(False)
         self.check_channel_history.setToolTip("Analizza storico canale trasmissione delle ultime 24 ore")
         checks_row.addWidget(self.check_channel_history)
+        
+        self.check_signal_history = QCheckBox("Storico Segnale")
+        self.check_signal_history.setChecked(False)
+        self.check_signal_history.setToolTip("Analizza storico potenza segnale LTE delle ultime 24 ore")
+        checks_row.addWidget(self.check_signal_history)
         
         checks_layout.addLayout(checks_row)
         options_layout.addLayout(checks_layout, stretch=1)
@@ -1187,6 +1244,8 @@ class MainWindow(QMainWindow):
             checks.append("Storico SOC 15gg")
         if self.check_channel_history.isChecked():
             checks.append("Storico Canale 24h")
+        if self.check_signal_history.isChecked():
+            checks.append("Storico Segnale 24h")
         
         reply = QMessageBox.question(
             self,
@@ -1227,8 +1286,10 @@ class MainWindow(QMainWindow):
             check_mongodb=self.check_mongodb.isChecked(),
             check_soc_history=self.check_soc_history.isChecked(),
             check_channel_history=self.check_channel_history.isChecked(),
+            check_signal_history=self.check_signal_history.isChecked(),
             soc_days=15,
-            channel_hours=24
+            channel_hours=24,
+            signal_hours=24
         )
         self.worker_thread.progress_signal.connect(self.on_progress)
         self.worker_thread.completed_signal.connect(self.on_completed)
@@ -1452,11 +1513,12 @@ class MainWindow(QMainWindow):
         self.stats_label.setText(f"OK: {ok_count} | KO: {ko_count} | In corso: {in_progress}")
         self.status_label.setText(f"{message[:50]}..." if len(message) > 50 else message)
     
-    def on_completed(self, results: list, soc_data: dict = None, channel_data: dict = None):
+    def on_completed(self, results: list, soc_data: dict = None, channel_data: dict = None, signal_data: dict = None):
         """Callback completamento"""
         self.results = results
         self.soc_data = soc_data or {}  # Salva i dati SOC per l'export
         self.channel_data = channel_data or {}  # Salva i dati canale per l'export
+        self.signal_data = signal_data or {}  # Salva i dati segnale per l'export
         
         for device in results:
             self.update_device_in_table(device)
@@ -1508,12 +1570,13 @@ class MainWindow(QMainWindow):
         )
         
         if file_path:
-            # Passa anche i dati SOC e canale se disponibili
+            # Passa anche i dati SOC, canale e segnale se disponibili
             success, result = self.result_exporter.export_diagnostic_results(
                 self.results, 
                 file_path,
                 soc_data=self.soc_data if self.soc_data else None,
-                channel_data=self.channel_data if self.channel_data else None
+                channel_data=self.channel_data if self.channel_data else None,
+                signal_data=self.signal_data if self.signal_data else None
             )
             
             if success:

@@ -319,7 +319,8 @@ class ResultExporter:
     def export_diagnostic_results(self, results: list, 
                                    output_path: Optional[str] = None,
                                    soc_data: Optional[dict] = None,
-                                   channel_data: Optional[dict] = None) -> tuple[bool, str]:
+                                   channel_data: Optional[dict] = None,
+                                   signal_data: Optional[dict] = None) -> tuple[bool, str]:
         """Esporta i risultati diagnostici in un file Excel.
         
         Args:
@@ -327,6 +328,7 @@ class ResultExporter:
             output_path: Percorso del file di output (opzionale)
             soc_data: Dict {device_id: soc_history} per lo sheet Storico SOC (opzionale)
             channel_data: Dict {device_id: channel_history} per lo sheet Storico Canale (opzionale)
+            signal_data: Dict {device_id: signal_history} per lo sheet Storico Segnale (opzionale)
         """
         if not results:
             return False, "Nessun risultato da esportare"
@@ -507,6 +509,13 @@ class ResultExporter:
                     self.export_channel_history_sheet(writer, workbook, results, channel_data, hours=24)
                 else:
                     print("DEBUG: channel_data è vuoto o None")
+                
+                # Aggiungi sheet Storico Segnale se ci sono dati
+                if signal_data:
+                    print(f"DEBUG: signal_data ha {len(signal_data)} dispositivi")
+                    self.export_signal_history_sheet(writer, workbook, results, signal_data, hours=24)
+                else:
+                    print("DEBUG: signal_data è vuoto o None")
             
             return True, str(output_path)
             
@@ -721,7 +730,7 @@ class ResultExporter:
             # Statistiche
             row["LTE"] = device_channel.get("lte_count", "")
             row["NBIoT"] = device_channel.get("nbiot_count", "")
-            row["LORA"] = device_channel.get("lora_count", "")
+            row["Altro"] = device_channel.get("other_count", "")
             row["Canali Usati"] = ", ".join(device_channel.get("channels_used", []))
             
             if device_channel.get("error"):
@@ -763,8 +772,8 @@ class ResultExporter:
             'align': 'center'
         })
         
-        # LORA = GIALLO
-        lora_format = workbook.add_format({
+        # Altro (LORA) = GIALLO
+        other_format = workbook.add_format({
             'bg_color': '#FFEB9C',   
             'font_color': '#9C6500', 
             'border': 1,
@@ -792,7 +801,7 @@ class ResultExporter:
         stats_start_col = hour_end_col + 1
         worksheet.set_column(stats_start_col, stats_start_col, 5)      # LTE
         worksheet.set_column(stats_start_col + 1, stats_start_col + 1, 6)  # NBIoT
-        worksheet.set_column(stats_start_col + 2, stats_start_col + 2, 6)  # LORA
+        worksheet.set_column(stats_start_col + 2, stats_start_col + 2, 5)  # Altro
         worksheet.set_column(stats_start_col + 3, stats_start_col + 3, 15) # Canali Usati
         worksheet.set_column(stats_start_col + 4, stats_start_col + 4, 25) # Errore
         
@@ -805,7 +814,7 @@ class ResultExporter:
                 'value': 'LTE',
                 'format': lte_format
             })
-            # NBIOT = blu
+            # NBIOT = giallo
             worksheet.conditional_format(1, col, len(df_channel), col, {
                 'type': 'text',
                 'criteria': 'containing',
@@ -818,17 +827,157 @@ class ResultExporter:
                 'value': 'NB-IOT',
                 'format': nbiot_format
             })
-            # LORA = giallo
-            worksheet.conditional_format(1, col, len(df_channel), col, {
-                'type': 'text',
-                'criteria': 'containing',
-                'value': 'LORA',
-                'format': lora_format
-            })
         
         # Freeze panes e autofilter
         worksheet.freeze_panes(1, 0)
         worksheet.autofilter(0, 0, len(df_channel), len(df_channel.columns) - 1)
+    
+    def export_signal_history_sheet(self, writer, workbook, results: list, signal_data: dict, hours: int = 24):
+        """
+        Aggiunge lo sheet "Storico Segnale" al file Excel.
+        
+        Args:
+            writer: ExcelWriter attivo
+            workbook: Workbook xlsxwriter
+            results: Lista dei DeviceInfo
+            signal_data: Dict {device_id: signal_history_dict} con i dati segnale
+            hours: Numero di ore analizzate
+        """
+        from datetime import datetime, timedelta
+        
+        # Genera le ore delle ultime N ore
+        now = datetime.now()
+        hour_columns = []
+        for i in range(hours):
+            h = now - timedelta(hours=i)
+            hour_columns.append(h.strftime("%Y-%m-%d %H:00"))
+        
+        # Costruisci i dati
+        data = []
+        for r in results:
+            device_signal = signal_data.get(r.device_id, {})
+            hourly_signal = device_signal.get("hourly_signal", {})
+            
+            row = {
+                "DeviceID": r.device_id,
+                "Linea": r.linea,
+                "Sostegno": r.sostegno,
+                "Vendor": r.vendor.value,
+                "Tipo": r.device_type.value,
+            }
+            
+            # Aggiungi colonne per ogni ora
+            for hour_str in hour_columns:
+                row[hour_str] = hourly_signal.get(hour_str, "")
+            
+            # Statistiche
+            row["Media"] = device_signal.get("avg", "")
+            row["Min"] = device_signal.get("min", "")
+            row["Max"] = device_signal.get("max", "")
+            
+            if device_signal.get("error"):
+                row["Errore"] = device_signal.get("error", "")[:30]
+            else:
+                row["Errore"] = ""
+            
+            data.append(row)
+        
+        import pandas as pd
+        df_signal = pd.DataFrame(data)
+        df_signal.to_excel(writer, index=False, sheet_name='Storico Segnale')
+        
+        # Formattazione
+        worksheet = writer.sheets['Storico Segnale']
+        
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#0066CC',
+            'font_color': 'white',
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter'
+        })
+        
+        # Formati per livello segnale (dBm)
+        # Segnale forte: > -70 dBm = verde
+        strong_signal_format = workbook.add_format({
+            'bg_color': '#C6EFCE',
+            'font_color': '#006100',
+            'border': 1,
+            'align': 'center'
+        })
+        
+        # Segnale medio: -70 a -85 dBm = giallo
+        medium_signal_format = workbook.add_format({
+            'bg_color': '#FFEB9C',
+            'font_color': '#9C6500',
+            'border': 1,
+            'align': 'center'
+        })
+        
+        # Segnale debole: < -85 dBm = rosso
+        weak_signal_format = workbook.add_format({
+            'bg_color': '#FFC7CE',
+            'font_color': '#9C0006',
+            'border': 1,
+            'align': 'center'
+        })
+        
+        # Scrivi header
+        for col_num, value in enumerate(df_signal.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+        
+        # Imposta larghezze colonne
+        worksheet.set_column(0, 0, 28)  # DeviceID
+        worksheet.set_column(1, 1, 10)  # Linea
+        worksheet.set_column(2, 2, 18)  # Sostegno
+        worksheet.set_column(3, 3, 8)   # Vendor
+        worksheet.set_column(4, 4, 8)   # Tipo
+        
+        # Colonne ore (più strette)
+        hour_start_col = 5
+        hour_end_col = hour_start_col + hours - 1
+        for col in range(hour_start_col, hour_end_col + 1):
+            worksheet.set_column(col, col, 12)
+        
+        # Colonne statistiche
+        stats_start_col = hour_end_col + 1
+        worksheet.set_column(stats_start_col, stats_start_col, 7)      # Media
+        worksheet.set_column(stats_start_col + 1, stats_start_col + 1, 5)  # Min
+        worksheet.set_column(stats_start_col + 2, stats_start_col + 2, 5)  # Max
+        worksheet.set_column(stats_start_col + 3, stats_start_col + 3, 25) # Errore
+        
+        # Formattazione condizionale per le colonne segnale
+        # Nota: i valori sono negativi (dBm), quindi:
+        # > -70 (forte) significa valore più grande (es: -65 > -70)
+        # < -85 (debole) significa valore più piccolo (es: -95 < -85)
+        for col in range(hour_start_col, hour_end_col + 1):
+            # Segnale forte: > -70 dBm
+            worksheet.conditional_format(1, col, len(df_signal), col, {
+                'type': 'cell',
+                'criteria': '>',
+                'value': -70,
+                'format': strong_signal_format
+            })
+            # Segnale medio: tra -85 e -70 dBm
+            worksheet.conditional_format(1, col, len(df_signal), col, {
+                'type': 'cell',
+                'criteria': 'between',
+                'minimum': -85,
+                'maximum': -70,
+                'format': medium_signal_format
+            })
+            # Segnale debole: < -85 dBm
+            worksheet.conditional_format(1, col, len(df_signal), col, {
+                'type': 'cell',
+                'criteria': '<',
+                'value': -85,
+                'format': weak_signal_format
+            })
+        
+        # Freeze panes e autofilter
+        worksheet.freeze_panes(1, 0)
+        worksheet.autofilter(0, 0, len(df_signal), len(df_signal.columns) - 1)
     
     def export_results(self, results: list, output_path: Optional[str] = None) -> tuple[bool, str]:
         """Alias per compatibilità con vecchia versione"""

@@ -603,6 +603,145 @@ class MongoDBChecker:
         
         return result
     
+    def get_signal_history(self, device_id: str, hours: int = 24) -> dict:
+        """
+        Recupera lo storico del segnale LTE per un dispositivo.
+        Prende un valore per ora (l'ultimo disponibile).
+        
+        Cerca in due metriche possibili:
+        - payload.metrics.SENS_Digil2_LtePowerSignal.value (primaria)
+        - payload.metrics.EGM_OUT_SENS_23_VAR_14_value.value (alternativa)
+        
+        Args:
+            device_id: Il clientId del dispositivo
+            hours: Numero di ore da analizzare (default 24)
+            
+        Returns:
+            Dict con:
+                - device_id: str
+                - hourly_signal: dict {hour_str: signal_dbm} es: {"2026-01-20 14:00": -85, "2026-01-20 13:00": -90}
+                - avg: float (media)
+                - min: int (minimo - segnale peggiore)
+                - max: int (massimo - segnale migliore)
+                - error: str (eventuale errore)
+        """
+        result = {
+            "device_id": device_id,
+            "hourly_signal": {},
+            "avg": None,
+            "min": None,
+            "max": None,
+            "error": ""
+        }
+        
+        # Verifica connessione - usa collection diagnostics
+        if self._collection_diags is None:
+            success, msg = self.connect()
+            if not success:
+                result["error"] = msg
+                return result
+        
+        try:
+            now = datetime.now()
+            start_time = now - timedelta(hours=hours)
+            start_ms = int(start_time.timestamp() * 1000)
+            end_ms = int(now.timestamp() * 1000)
+            
+            # Query che cerca in entrambe le metriche possibili
+            # Usa $or per trovare documenti con una delle due metriche
+            pipeline = [
+                {
+                    "$match": {
+                        "clientId": device_id,
+                        "payload.metrics.TIMESTAMP.value": {
+                            "$gte": start_ms,
+                            "$lte": end_ms
+                        },
+                        "$or": [
+                            {"payload.metrics.SENS_Digil2_LtePowerSignal.value": {"$exists": True}},
+                            {"payload.metrics.EGM_OUT_SENS_23_VAR_14_value.value": {"$exists": True}}
+                        ]
+                    }
+                },
+                {
+                    "$addFields": {
+                        "timestamp_date": {
+                            "$toDate": "$payload.metrics.TIMESTAMP.value"
+                        },
+                        # Prende il valore dalla prima metrica se esiste, altrimenti dalla seconda
+                        "signal_value": {
+                            "$ifNull": [
+                                "$payload.metrics.SENS_Digil2_LtePowerSignal.value",
+                                "$payload.metrics.EGM_OUT_SENS_23_VAR_14_value.value"
+                            ]
+                        }
+                    }
+                },
+                {
+                    "$addFields": {
+                        "hour_str": {
+                            "$dateToString": {
+                                "format": "%Y-%m-%d %H:00",
+                                "date": "$timestamp_date"
+                            }
+                        }
+                    }
+                },
+                {
+                    "$sort": {"payload.metrics.TIMESTAMP.value": -1}
+                },
+                {
+                    "$group": {
+                        "_id": "$hour_str",
+                        "signal": {"$first": "$signal_value"},
+                        "timestamp": {"$first": "$payload.metrics.TIMESTAMP.value"}
+                    }
+                },
+                {
+                    "$sort": {"_id": -1}  # Ordina per ora decrescente
+                }
+            ]
+            
+            docs = list(self._collection_diags.aggregate(pipeline))
+            
+            if docs:
+                signal_values = []
+                
+                for doc in docs:
+                    hour_str = doc["_id"]
+                    signal = doc["signal"]
+                    
+                    # Gestisci il caso in cui signal sia un dict con $numberLong o $numberDouble
+                    if isinstance(signal, dict):
+                        if "$numberLong" in signal:
+                            signal = int(signal["$numberLong"])
+                        elif "$numberDouble" in signal:
+                            signal = float(signal["$numberDouble"])
+                        elif "$numberInt" in signal:
+                            signal = int(signal["$numberInt"])
+                    elif isinstance(signal, (int, float)):
+                        signal = int(signal)
+                    else:
+                        try:
+                            signal = int(float(str(signal)))
+                        except:
+                            continue
+                    
+                    result["hourly_signal"][hour_str] = signal
+                    signal_values.append(signal)
+                
+                if signal_values:
+                    result["avg"] = round(sum(signal_values) / len(signal_values), 1)
+                    result["min"] = min(signal_values)  # Più negativo = peggiore
+                    result["max"] = max(signal_values)  # Meno negativo = migliore
+            else:
+                result["error"] = f"Nessun dato segnale nelle ultime {hours}h"
+            
+        except Exception as e:
+            result["error"] = str(e)[:150]
+        
+        return result
+    
     def check_devices_batch(self, device_ids: list, 
                             progress_callback=None) -> list[MongoCheckResult]:
         """
