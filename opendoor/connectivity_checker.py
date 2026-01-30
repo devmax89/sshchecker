@@ -83,7 +83,6 @@ class DeviceInfo:
     api_error: str = ""
     api_timestamp: Optional[str] = None  # Timestamp decodificato dalla risposta API
     battery_ok: Optional[bool] = None
-    door_open_api: Optional[bool] = None  # Allarme porta da API (indicatore veloce)
     door_open: Optional[bool] = None  # Allarme porta da MongoDB (raw)
     door_open_valid: Optional[bool] = None  # True solo se allarme successivo a data installazione
     door_open_timestamp: Optional[datetime] = None  # Timestamp dell'allarme porta da MongoDB

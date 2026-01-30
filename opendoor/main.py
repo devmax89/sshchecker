@@ -383,9 +383,8 @@ class DiagnosticWorkerThread(QThread):
                     if api_result:
                         device.api_data = api_result
                         device.battery_ok = api_result.get('battery_ok', None)
-                        # door_open viene letto dall'API come indicatore veloce
-                        # Se True, verrà validato su MongoDB nella fase successiva
-                        device.door_open_api = api_result.get('door_open', None)
+                        # NOTA: door_open NON viene più letto dall'API
+                        # Viene gestito SOLO da MongoDB collection unsolicited con validazione data installazione
                         device.lte_ok = api_result.get('lte_ok', None)
                         device.soc_percent = api_result.get('soc_percent', None)
                         device.soh_percent = api_result.get('soh_percent', None)
@@ -443,26 +442,15 @@ class DiagnosticWorkerThread(QThread):
                     if mongo_result.error:
                         device.mongodb_error = mongo_result.error
                     
-                    # OTTIMIZZAZIONE: Check allarme porta aperta SOLO se API indica allarme attivo
-                    # L'API è veloce, MongoDB è lento (collection unsolicited non indicizzata)
-                    # Se door_open_api == True → verifichiamo su MongoDB per validazione temporale
-                    # Se door_open_api == False/None → skippiamo la query MongoDB
-                    door_open_api = getattr(device, 'door_open_api', None)
-                    
-                    if door_open_api is True:
-                        # API indica allarme attivo, verifichiamo timestamp vs data installazione
-                        door_result = mongo_checker.check_door_alarm(
-                            device.device_id, 
-                            installation_date=device.data_installazione
-                        )
-                        device.door_open = door_result.get('door_open', False)
-                        device.door_open_valid = door_result.get('door_open_valid', False)
-                        device.door_open_timestamp = door_result.get('door_open_timestamp', None)
-                    else:
-                        # API non indica allarme → nessun allarme porta, skip query MongoDB
-                        device.door_open = False
-                        device.door_open_valid = False
-                        device.door_open_timestamp = None
+                    # Check allarme porta aperta (da collection unsolicited)
+                    # Passa la data di installazione per validazione temporale
+                    door_result = mongo_checker.check_door_alarm(
+                        device.device_id, 
+                        installation_date=device.data_installazione
+                    )
+                    device.door_open = door_result.get('door_open', False)
+                    device.door_open_valid = door_result.get('door_open_valid', False)
+                    device.door_open_timestamp = door_result.get('door_open_timestamp', None)
                     
                 except Exception as e:
                     device.mongodb_error = str(e)[:100]

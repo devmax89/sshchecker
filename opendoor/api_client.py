@@ -149,10 +149,8 @@ class DigilAPIClient:
         """Estrae le metriche rilevanti dalla risposta API."""
         result = {
             "battery_ok": None,
-            # door_open viene letto dall'API come INDICATORE VELOCE
-            # Se True, verrà poi validato su MongoDB confrontando con data installazione
-            # Se False, skippiamo la query MongoDB (ottimizzazione performance)
-            "door_open": None,
+            # NOTA: door_open NON viene più letto dall'API
+            # Viene gestito SOLO da MongoDB collection unsolicited con validazione data installazione
             "lte_ok": None,
             "soc_percent": None,
             "soh_percent": None,
@@ -211,12 +209,9 @@ class DigilAPIClient:
             if battery_warn is not None:
                 result["battery_ok"] = not battery_warn
         
-        # Porta aperta - letto dall'API come INDICATORE VELOCE
-        # Se True, verrà poi validato su MongoDB confrontando timestamp con data installazione
-        # Se False, skippiamo la query MongoDB lenta (ottimizzazione performance)
-        door_alarm = diags.get("ALG_Digil2_Alm_Open_Door", {}).get("value")
-        if door_alarm is not None:
-            result["door_open"] = door_alarm
+        # NOTA: Porta aperta (door_open) NON viene più letto dall'API
+        # Viene gestito SOLO da MongoDB collection unsolicited con validazione data installazione
+        # Questo per evitare falsi positivi da allarmi precedenti all'installazione
         
         # === MEASURES (Misure) ===
         

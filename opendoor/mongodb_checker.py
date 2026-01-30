@@ -720,7 +720,7 @@ class MongoDBChecker:
         
         Cerca in due metriche possibili:
         - payload.metrics.SENS_Digil2_LtePowerSignal.value (primaria)
-        - payload.metrics.EGM_OUT_SENS_23_VAR_14_null.value (alternativa)
+        - payload.metrics.EGM_OUT_SENS_23_VAR_14_value.value (alternativa)
         
         Args:
             device_id: Il clientId del dispositivo
@@ -769,7 +769,7 @@ class MongoDBChecker:
                         },
                         "$or": [
                             {"payload.metrics.SENS_Digil2_LtePowerSignal.value": {"$exists": True}},
-                            {"payload.metrics.EGM_OUT_SENS_23_VAR_14_null.value": {"$exists": True}}
+                            {"payload.metrics.EGM_OUT_SENS_23_VAR_14_value.value": {"$exists": True}}
                         ]
                     }
                 },
@@ -782,7 +782,7 @@ class MongoDBChecker:
                         "signal_value": {
                             "$ifNull": [
                                 "$payload.metrics.SENS_Digil2_LtePowerSignal.value",
-                                "$payload.metrics.EGM_OUT_SENS_23_VAR_14_null.value"
+                                "$payload.metrics.EGM_OUT_SENS_23_VAR_14_value.value"
                             ]
                         }
                     }
