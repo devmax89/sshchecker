@@ -273,8 +273,9 @@ class DiagnosticWorkerThread(QThread):
     phase_signal = pyqtSignal(str)  # current phase description
     
     def __init__(self, devices: list, max_workers: int = 10,
-                 check_ssh: bool = True, check_api: bool = True, 
-                 check_mongodb: bool = True, check_soc_history: bool = False,
+                 check_ssh: bool = False, check_api: bool = True, 
+                 check_mongodb: bool = True, check_door_alarm: bool = False,
+                 check_soc_history: bool = False,
                  check_channel_history: bool = False, check_signal_history: bool = False,
                  soc_days: int = 15, channel_hours: int = 24, signal_hours: int = 24):
         super().__init__()
@@ -284,6 +285,7 @@ class DiagnosticWorkerThread(QThread):
         self.check_api = check_api
         self.check_mongodb = check_mongodb
         self.check_soc_history = check_soc_history
+        self.check_door_alarm = check_door_alarm
         self.check_channel_history = check_channel_history
         self.check_signal_history = check_signal_history
         self.soc_days = soc_days
@@ -297,19 +299,35 @@ class DiagnosticWorkerThread(QThread):
         
     def run(self):
         try:
-            # Calcola numero totale di fasi
-            total_phases = 1  # SSH sempre
-            if self.check_api: total_phases += 1
+            # Calcola numero totale di fasi (SSH ora è opzionale come gli altri)
+            total_phases = 0
             if self.check_mongodb: total_phases += 1
+            if self.check_api: total_phases += 1
+            if self.check_ssh: total_phases += 1
             if self.check_soc_history: total_phases += 1
             if self.check_channel_history: total_phases += 1
             if self.check_signal_history: total_phases += 1
+            if total_phases == 0: total_phases = 1  # sicurezza
             current_phase = 0
             
-            # Fase 1: SSH/Ping
-            if self.check_ssh:
+            results = self.devices
+            
+            # Fase 1 (default): MongoDB - sorgente primaria della nuova logica
+            if self.check_mongodb and not self._stop_requested:
                 current_phase += 1
-                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: Check SSH/Ping...")
+                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: Check MongoDB 24h...")
+                self._run_mongodb_checks(results)
+            
+            # Fase 2 (default): API Diagnostica (Onesait) - sorgente secondaria
+            if self.check_api and not self._stop_requested:
+                current_phase += 1
+                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: API Diagnostica (Onesait)...")
+                self._run_api_checks(results)
+            
+            # Fase 3 (opzionale): SSH/Ping - check diretto di rete
+            if self.check_ssh and not self._stop_requested:
+                current_phase += 1
+                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: Check SSH/Ping (diretto)...")
                 self.checker = MultiThreadChecker(max_workers=self.max_workers)
                 
                 def on_progress(device, message, current, total):
@@ -319,24 +337,14 @@ class DiagnosticWorkerThread(QThread):
                     self.bridge_status_signal.emit(connected, message)
                 
                 results = self.checker.check_devices(
-                    self.devices,
+                    results,
                     progress_callback=on_progress,
                     bridge_callback=on_bridge_status
                 )
-            else:
-                results = self.devices
-            
-            # Fase 2: API Diagnostica
-            if self.check_api and not self._stop_requested:
-                current_phase += 1
-                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: API Diagnostica...")
-                self._run_api_checks(results)
-            
-            # Fase 3: MongoDB
-            if self.check_mongodb and not self._stop_requested:
-                current_phase += 1
-                self.phase_signal.emit(f"Fase {current_phase}/{total_phases}: Check MongoDB 24h...")
-                self._run_mongodb_checks(results)
+                
+                # Marca i device come "SSH verificato direttamente"
+                for device in results:
+                    device.ssh_directly_checked = True
             
             # Fase 4: Storico SOC (opzionale)
             if self.check_soc_history and not self._stop_requested:
@@ -443,23 +451,32 @@ class DiagnosticWorkerThread(QThread):
                     if mongo_result.error:
                         device.mongodb_error = mongo_result.error
                     
-                    # OTTIMIZZAZIONE: Check allarme porta aperta SOLO se API indica allarme attivo
-                    # L'API è veloce, MongoDB è lento (collection unsolicited non indicizzata)
-                    # Se door_open_api == True → verifichiamo su MongoDB per validazione temporale
-                    # Se door_open_api == False/None → skippiamo la query MongoDB
-                    door_open_api = getattr(device, 'door_open_api', None)
-                    
-                    if door_open_api is True:
-                        # API indica allarme attivo, verifichiamo timestamp vs data installazione
-                        door_result = mongo_checker.check_door_alarm(
-                            device.device_id, 
-                            installation_date=device.data_installazione
-                        )
-                        device.door_open = door_result.get('door_open', False)
-                        device.door_open_valid = door_result.get('door_open_valid', False)
-                        device.door_open_timestamp = door_result.get('door_open_timestamp', None)
+                    # ALLARME PORTA: eseguito solo se check_door_alarm è attivo (opzionale)
+                    # Default OFF perché la query MongoDB su collection unsolicited è lenta
+                    # Logica: Onesait prima, MongoDB come fallback se Onesait non segnala
+                    if self.check_door_alarm:
+                        door_open_api = getattr(device, 'door_open_api', None)
+                        
+                        if door_open_api is True:
+                            # Onesait segnala allarme attivo → valida con data installazione su MongoDB
+                            door_result = mongo_checker.check_door_alarm(
+                                device.device_id,
+                                installation_date=device.data_installazione
+                            )
+                            device.door_open = door_result.get('door_open', False)
+                            device.door_open_valid = door_result.get('door_open_valid', False)
+                            device.door_open_timestamp = door_result.get('door_open_timestamp', None)
+                        else:
+                            # Onesait non segnala → MongoDB come fonte di verità
+                            door_result = mongo_checker.check_door_alarm(
+                                device.device_id,
+                                installation_date=device.data_installazione
+                            )
+                            device.door_open = door_result.get('door_open', False)
+                            device.door_open_valid = door_result.get('door_open_valid', False)
+                            device.door_open_timestamp = door_result.get('door_open_timestamp', None)
                     else:
-                        # API non indica allarme → nessun allarme porta, skip query MongoDB
+                        # Check porta disabilitato → nessun allarme porta rilevato
                         device.door_open = False
                         device.door_open_valid = False
                         device.door_open_timestamp = None
@@ -624,31 +641,42 @@ class DiagnosticWorkerThread(QThread):
                 device.connectivity_note = ""
     
     def _simple_classify(self, device) -> str:
-        """Classificazione semplificata di fallback"""
-        # SSH KO
-        ssh_ok = device.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(device, 'ssh_status') else None
-        ping_ok = device.ping_status == ConnectionStatus.PING_OK if hasattr(device, 'ping_status') else None
-        
+        """Classificazione semplificata di fallback - usa logica derivata SSH"""
         # API data
         battery_ok = getattr(device, 'battery_ok', None)
         door_open = getattr(device, 'door_open', None)
         lte_ok = getattr(device, 'lte_ok', None)
-        
-        # MongoDB
         mongodb_ok = getattr(device, 'mongodb_has_data', None)
+        
+        # Se SSH verificato direttamente, usa quei valori
+        ssh_directly_checked = getattr(device, 'ssh_directly_checked', False)
+        if ssh_directly_checked:
+            ssh_ok = device.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(device, 'ssh_status') else False
+        else:
+            # Deriva SSH/Ping da MongoDB + Onesait
+            api_timestamp = getattr(device, 'api_timestamp', None)
+            onesait_ok = bool(api_timestamp)
+            if mongodb_ok is True:
+                ssh_ok = True
+            elif onesait_ok:
+                ssh_ok = True
+            elif mongodb_ok is False:
+                ssh_ok = False
+            else:
+                ssh_ok = None
         
         # Logica di classificazione
         if door_open == True:
             return "Porta aperta"
         if battery_ok == False:
             return "Allarme batteria"
-        if not ssh_ok and not ping_ok:
-            return "Disconnesso"
-        if mongodb_ok == False and (ssh_ok or lte_ok):
-            return "Metriche assenti"
-        if ssh_ok and lte_ok and mongodb_ok:
+        if mongodb_ok is True:
             return "OK"
-        if not lte_ok:
+        if mongodb_ok is False and ssh_ok:
+            return "Metriche assenti"
+        if ssh_ok is False:
+            return "Disconnesso"
+        if lte_ok is False:
             return "Disconnesso"
         
         return "Non classificato"
@@ -937,8 +965,9 @@ class MainWindow(QMainWindow):
         checks_row = QHBoxLayout()
         
         self.check_ssh = QCheckBox("SSH/Ping")
-        self.check_ssh.setChecked(True)
-        self.check_ssh.setEnabled(False)  # Sempre attivo
+        self.check_ssh.setChecked(False)  # Opzionale - default OFF
+        # SSH/Ping è opzionale: il risultato viene derivato da MongoDB + Onesait
+        # Abilitare solo se si vuole eseguire il check diretto di rete
         checks_row.addWidget(self.check_ssh)
         
         self.check_api = QCheckBox("API Diagnostica")
@@ -948,6 +977,11 @@ class MainWindow(QMainWindow):
         self.check_mongodb = QCheckBox("MongoDB (24h)")
         self.check_mongodb.setChecked(True)
         checks_row.addWidget(self.check_mongodb)
+        
+        self.check_door_alarm = QCheckBox("Porta Aperta")
+        self.check_door_alarm.setChecked(False)
+        self.check_door_alarm.setToolTip("Verifica allarme porta aperta (Onesait + MongoDB unsolicited) - rallenta il test")
+        checks_row.addWidget(self.check_door_alarm)
         
         self.check_soc_history = QCheckBox("Storico SOC")
         self.check_soc_history.setChecked(False)
@@ -1265,6 +1299,8 @@ class MainWindow(QMainWindow):
             checks.append("API Diagnostica")
         if self.check_mongodb.isChecked():
             checks.append("MongoDB 24h")
+        if self.check_door_alarm.isChecked():
+            checks.append("Porta Aperta")
         if self.check_soc_history.isChecked():
             checks.append("Storico SOC 15gg")
         if self.check_channel_history.isChecked():
@@ -1310,6 +1346,7 @@ class MainWindow(QMainWindow):
             check_api=self.check_api.isChecked(),
             check_mongodb=self.check_mongodb.isChecked(),
             check_soc_history=self.check_soc_history.isChecked(),
+            check_door_alarm=self.check_door_alarm.isChecked(),
             check_channel_history=self.check_channel_history.isChecked(),
             check_signal_history=self.check_signal_history.isChecked(),
             soc_days=15,
@@ -1461,8 +1498,23 @@ class MainWindow(QMainWindow):
                 lte_text = "OK" if lte_ok else ("KO" if lte_ok is False else "0")
                 self.results_table.item(row, 8).setText(lte_text)
                 
-                # SSH
-                ssh_text = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                # SSH - reale se verificato direttamente, derivato altrimenti
+                ssh_directly_checked = getattr(device, 'ssh_directly_checked', False)
+                if ssh_directly_checked:
+                    ssh_text = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                else:
+                    # Deriva da MongoDB + Onesait
+                    api_timestamp = getattr(device, 'api_timestamp', None)
+                    onesait_ok = bool(api_timestamp)
+                    if mongodb_ok is True:
+                        ssh_derived = True
+                    elif onesait_ok:
+                        ssh_derived = True
+                    elif mongodb_ok is False:
+                        ssh_derived = False
+                    else:
+                        ssh_derived = None
+                    ssh_text = "OK" if ssh_derived is True else ("KO" if ssh_derived is False else "-")
                 self.results_table.item(row, 9).setText(ssh_text)
                 
                 # Batteria
