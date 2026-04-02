@@ -1445,12 +1445,26 @@ class MainWindow(QMainWindow):
                     mongo_text = mongo_error[:15] if mongo_error else "-"
                 self.results_table.item(row, 7).setText(mongo_text)
                 
-                # LTE
-                lte_text = "OK" if lte_ok else ("KO" if lte_ok is False else "0")
+                # LTE/SSH - stessa logica derivata per coerenza
+                ssh_directly_checked = getattr(device, 'ssh_directly_checked', False)
+                api_timestamp = getattr(device, 'api_timestamp', None)
+                onesait_ok = bool(api_timestamp)
+                if ssh_directly_checked:
+                    ssh_text = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                    lte_text = ssh_text
+                elif mongodb_ok is True:
+                    ssh_text = "OK"
+                    lte_text = "OK"
+                elif onesait_ok:
+                    ssh_text = "OK"
+                    lte_text = "OK"
+                elif mongodb_ok is False:
+                    ssh_text = "KO"
+                    lte_text = "KO"
+                else:
+                    ssh_text = "-"
+                    lte_text = "OK" if lte_ok else ("KO" if lte_ok is False else "-")
                 self.results_table.item(row, 8).setText(lte_text)
-                
-                # SSH
-                ssh_text = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
                 self.results_table.item(row, 9).setText(ssh_text)
                 
                 # Batteria

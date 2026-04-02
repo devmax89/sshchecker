@@ -443,29 +443,32 @@ class ResultExporter:
                 door_open_timestamp = getattr(r, 'door_open_timestamp', None)
                 malfunction = getattr(r, 'malfunction_type', '')
                 
-                # SSH/Ping: reale se verificato direttamente, derivato altrimenti
+                # SSH/LTE: stessa logica derivata per coerenza tra le due colonne
+                # MongoDB OK → SSH/LTE OK | MongoDB KO + Onesait OK → SSH/LTE OK | MongoDB KO + Onesait KO → SSH/LTE KO
                 ssh_directly_checked = getattr(r, 'ssh_directly_checked', False)
+                api_timestamp = getattr(r, 'api_timestamp', None)
+                onesait_ok = bool(api_timestamp)
                 if ssh_directly_checked:
                     ssh_ok = r.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(r, 'ssh_status') else None
                     ping_ok = r.ping_status == ConnectionStatus.PING_OK if hasattr(r, 'ping_status') else None
                     ssh_col = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                    lte_col = ssh_col  # LTE coerente con SSH reale
+                elif mongodb_ok is True:
+                    ssh_ok = True
+                    ssh_col = "OK"
+                    lte_col = "OK"
+                elif onesait_ok:
+                    ssh_ok = True
+                    ssh_col = "OK"
+                    lte_col = "OK"
+                elif mongodb_ok is False:
+                    ssh_ok = False
+                    ssh_col = "KO"
+                    lte_col = "KO"
                 else:
-                    # Deriva SSH/Ping da MongoDB + Onesait:
-                    # MongoDB OK → SSH OK matematicamente
-                    # MongoDB KO + Onesait OK → SSH OK (dato presente su piattaforma)
-                    # MongoDB KO + Onesait KO → SSH KO
-                    api_timestamp = getattr(r, 'api_timestamp', None)
-                    onesait_ok = bool(api_timestamp)
-                    if mongodb_ok is True:
-                        ssh_ok = True
-                    elif onesait_ok:
-                        ssh_ok = True
-                    elif mongodb_ok is False:
-                        ssh_ok = False
-                    else:
-                        ssh_ok = None
-                    # Asterisco indica valore derivato dalla logica, non misurato direttamente
-                    ssh_col = "OK" if ssh_ok is True else ("KO" if ssh_ok is False else "-")
+                    ssh_ok = None
+                    ssh_col = "-"
+                    lte_col = "OK" if lte_ok else ("KO" if lte_ok is False else "-")
                 
                 # MongoDB status
                 if mongodb_ok is True:
@@ -504,7 +507,7 @@ class ResultExporter:
                     "Tipo": r.device_type.value,
                     "Tipo Installazione AM": getattr(r, 'tipo_installazione_am', ''),
                     "Check MongoDB (24h)": mongo_status,
-                    "Check LTE": "OK" if lte_ok else ("KO" if lte_ok is False else "0"),
+                    "Check LTE": lte_col,
                     "Check SSH": ssh_col,
                     "Batteria": "OK" if battery_ok else ("KO" if battery_ok is False else "-"),
                     "Porta": porta_status,

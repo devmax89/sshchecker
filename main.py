@@ -1494,27 +1494,26 @@ class MainWindow(QMainWindow):
                     mongo_text = mongo_error[:15] if mongo_error else "-"
                 self.results_table.item(row, 7).setText(mongo_text)
                 
-                # LTE
-                lte_text = "OK" if lte_ok else ("KO" if lte_ok is False else "0")
-                self.results_table.item(row, 8).setText(lte_text)
-                
-                # SSH - reale se verificato direttamente, derivato altrimenti
+                # LTE/SSH - stessa logica derivata per coerenza tra le due colonne
                 ssh_directly_checked = getattr(device, 'ssh_directly_checked', False)
+                api_timestamp = getattr(device, 'api_timestamp', None)
+                onesait_ok = bool(api_timestamp)
                 if ssh_directly_checked:
                     ssh_text = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                    lte_text = ssh_text  # LTE coerente con SSH reale
+                elif mongodb_ok is True:
+                    ssh_text = "OK"
+                    lte_text = "OK"
+                elif onesait_ok:
+                    ssh_text = "OK"
+                    lte_text = "OK"
+                elif mongodb_ok is False:
+                    ssh_text = "KO"
+                    lte_text = "KO"
                 else:
-                    # Deriva da MongoDB + Onesait
-                    api_timestamp = getattr(device, 'api_timestamp', None)
-                    onesait_ok = bool(api_timestamp)
-                    if mongodb_ok is True:
-                        ssh_derived = True
-                    elif onesait_ok:
-                        ssh_derived = True
-                    elif mongodb_ok is False:
-                        ssh_derived = False
-                    else:
-                        ssh_derived = None
-                    ssh_text = "OK" if ssh_derived is True else ("KO" if ssh_derived is False else "-")
+                    ssh_text = "-"
+                    lte_text = "OK" if lte_ok else ("KO" if lte_ok is False else "-")
+                self.results_table.item(row, 8).setText(lte_text)
                 self.results_table.item(row, 9).setText(ssh_text)
                 
                 # Batteria

@@ -435,8 +435,6 @@ class ResultExporter:
             data = []
             for r in results:
                 # Determina esiti
-                ssh_ok = r.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(r, 'ssh_status') else None
-                ping_ok = r.ping_status == ConnectionStatus.PING_OK if hasattr(r, 'ping_status') else None
                 mongodb_ok = getattr(r, 'mongodb_has_data', None)
                 lte_ok = getattr(r, 'lte_ok', None)
                 battery_ok = getattr(r, 'battery_ok', None)
@@ -444,6 +442,32 @@ class ResultExporter:
                 door_open_valid = getattr(r, 'door_open_valid', None)
                 door_open_timestamp = getattr(r, 'door_open_timestamp', None)
                 malfunction = getattr(r, 'malfunction_type', '')
+
+                # SSH/LTE: stessa logica derivata per coerenza tra le due colonne
+                ssh_directly_checked = getattr(r, 'ssh_directly_checked', False)
+                api_timestamp = getattr(r, 'api_timestamp', None)
+                onesait_ok = bool(api_timestamp)
+                if ssh_directly_checked:
+                    ssh_ok = r.ssh_status == ConnectionStatus.SSH_PORT_OPEN if hasattr(r, 'ssh_status') else None
+                    ping_ok = r.ping_status == ConnectionStatus.PING_OK if hasattr(r, 'ping_status') else None
+                    ssh_col = "OK" if ssh_ok else ("KO" if ssh_ok is False else "-")
+                    lte_col = ssh_col
+                elif mongodb_ok is True:
+                    ssh_ok = True
+                    ssh_col = "OK"
+                    lte_col = "OK"
+                elif onesait_ok:
+                    ssh_ok = True
+                    ssh_col = "OK"
+                    lte_col = "OK"
+                elif mongodb_ok is False:
+                    ssh_ok = False
+                    ssh_col = "KO"
+                    lte_col = "KO"
+                else:
+                    ssh_ok = None
+                    ssh_col = "-"
+                    lte_col = "OK" if lte_ok else ("KO" if lte_ok is False else "-")
                 
                 # MongoDB status
                 if mongodb_ok is True:
@@ -482,8 +506,8 @@ class ResultExporter:
                     "Tipo": r.device_type.value,
                     "Tipo Installazione AM": getattr(r, 'tipo_installazione_am', ''),
                     "Check MongoDB (24h)": mongo_status,
-                    "Check LTE": "OK" if lte_ok else ("KO" if lte_ok is False else "0"),
-                    "Check SSH": "OK" if ssh_ok else ("KO" if ssh_ok is False else "-"),
+                    "Check LTE": lte_col,
+                    "Check SSH": ssh_col,
                     "Batteria": "OK" if battery_ok else ("KO" if battery_ok is False else "-"),
                     "Porta": porta_status,
                     "SOC %": getattr(r, 'soc_percent', None) or "",
