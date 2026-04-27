@@ -26,6 +26,7 @@ class MongoCheckResult:
     has_data_24h: bool = False
     last_timestamp: Optional[datetime] = None
     last_timestamp_ms: Optional[int] = None
+    last_received_on: Optional[datetime] = None
     error: str = ""
     checked: bool = False
 
@@ -307,6 +308,127 @@ class MongoDBChecker:
         
         return result
     
+    @staticmethod
+    def _to_int_ms(value) -> Optional[int]:
+        """Estrae un intero (ms epoch) da vari formati BSON / JSON."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, dict):
+            for key in ("$numberLong", "$numberInt"):
+                if key in value:
+                    try:
+                        return int(value[key])
+                    except (TypeError, ValueError):
+                        return None
+            if "$numberDouble" in value:
+                try:
+                    return int(float(value["$numberDouble"]))
+                except (TypeError, ValueError):
+                    return None
+        try:
+            return int(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_datetime(value) -> Optional[datetime]:
+        """
+        Converte valori provenienti da MongoDB (BSON Date, epoch ms/s, dict
+        `$date` / `$numberLong`) in un oggetto datetime locale. Ritorna None
+        per valori non rappresentabili (overflow, negativi, garbage).
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, dict):
+            if "$date" in value:
+                inner = value["$date"]
+                if isinstance(inner, dict):
+                    return MongoDBChecker._to_datetime(inner)
+                if isinstance(inner, str):
+                    try:
+                        return datetime.fromisoformat(inner.replace("Z", "+00:00"))
+                    except ValueError:
+                        pass
+                ms = MongoDBChecker._to_int_ms(inner)
+                if ms is None:
+                    return None
+                try:
+                    return datetime.fromtimestamp(ms / 1000.0)
+                except (OverflowError, OSError, ValueError):
+                    return None
+
+        ms = MongoDBChecker._to_int_ms(value)
+        if ms is None:
+            return None
+        try:
+            return datetime.fromtimestamp(ms / 1000.0)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+    def check_device_first_data(self, device_id: str) -> MongoCheckResult:
+        """
+        Verifica se il dispositivo ha MAI ricevuto dati su MongoDB (senza limite temporale).
+
+        Ordina per `receivedOn` desc (timestamp broker-side, affidabile) e
+        popola sia `last_timestamp` (dal payload `TIMESTAMP.value`, orologio
+        del device) che `last_received_on` (timestamp di ingestion lato broker).
+        KO (has_data_24h=False) solo se non esiste alcun documento per il
+        clientId nella collection event.
+        """
+        result = MongoCheckResult(device_id=device_id)
+
+        if self._collection is None:
+            success, msg = self.connect()
+            if not success:
+                result.error = msg
+                return result
+
+        try:
+            pipeline = [
+                {"$match": {"clientId": device_id}},
+                {"$sort": {"receivedOn": -1}},
+                {"$limit": 1},
+                {
+                    "$project": {
+                        "_id": 0,
+                        "clientId": 1,
+                        "timestamp": "$payload.metrics.TIMESTAMP.value",
+                        "receivedOn": 1
+                    }
+                }
+            ]
+
+            docs = list(self._collection.aggregate(pipeline))
+
+            if docs:
+                result.has_data_24h = True
+                result.checked = True
+                doc = docs[0]
+
+                ts_ms = self._to_int_ms(doc.get("timestamp"))
+                if ts_ms is not None:
+                    result.last_timestamp_ms = ts_ms
+                    try:
+                        result.last_timestamp = datetime.fromtimestamp(ts_ms / 1000.0)
+                    except (OverflowError, OSError, ValueError):
+                        result.last_timestamp = None
+
+                result.last_received_on = self._to_datetime(doc.get("receivedOn"))
+            else:
+                result.has_data_24h = False
+                result.checked = True
+
+        except Exception as e:
+            result.error = str(e)[:150]
+
+        return result
+
     def check_door_alarm(self, device_id: str, installation_date: Optional[datetime] = None) -> dict:
         """
         Verifica l'allarme porta aperta da MongoDB collection unsolicited.

@@ -1120,6 +1120,119 @@ class ResultExporter:
         """Alias per compatibilità con vecchia versione"""
         return self.export_diagnostic_results(results, output_path)
 
+    def export_first_arrival_results(self, rows: list,
+                                     output_path: Optional[str] = None) -> tuple[bool, str]:
+        """
+        Esporta i risultati del check "L.S. MongoDB" in Excel.
+
+        Args:
+            rows: lista di dict con chiavi:
+                  "ST Sostegno", "DeviceID", "Data Installazione",
+                  "Vendor", "Tipo", "Check MongoDB", "Ultimo receivedOn"
+            output_path: percorso destinazione (opzionale)
+
+        "Check MongoDB" = timestamp del payload (orologio del device). Vale
+        "KO" (in rosso) solo se nessun documento esiste per il device.
+        "Ultimo receivedOn" = timestamp broker-side (ingestion MongoDB), più
+        affidabile in caso di orologio device errato.
+        """
+        if not rows:
+            return False, "Nessun risultato da esportare"
+
+        if not output_path:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = self.output_dir / f"DIGIL_LS_MongoDB_{timestamp}.xlsx"
+
+        try:
+            columns = ["ST Sostegno", "DeviceID", "Data Installazione",
+                       "Vendor", "Tipo", "Check MongoDB", "Ultimo receivedOn"]
+            df = pd.DataFrame(rows, columns=columns)
+
+            with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='L.S. MongoDB')
+
+                workbook = writer.book
+                worksheet = writer.sheets['L.S. MongoDB']
+
+                header_format = workbook.add_format({
+                    'bold': True,
+                    'bg_color': '#0066CC',
+                    'font_color': 'white',
+                    'border': 1,
+                    'align': 'center',
+                    'valign': 'vcenter'
+                })
+
+                ko_format = workbook.add_format({
+                    'bg_color': '#FFC7CE',
+                    'font_color': '#9C0006',
+                    'border': 1,
+                    'bold': True
+                })
+
+                ok_format = workbook.add_format({
+                    'bg_color': '#C6EFCE',
+                    'font_color': '#006100',
+                    'border': 1
+                })
+
+                for col_num, value in enumerate(df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
+
+                column_widths = {
+                    "ST Sostegno": 20,
+                    "DeviceID": 30,
+                    "Data Installazione": 16,
+                    "Vendor": 10,
+                    "Tipo": 10,
+                    "Check MongoDB": 22,
+                    "Ultimo receivedOn": 22
+                }
+                for col_num, col_name in enumerate(df.columns):
+                    worksheet.set_column(col_num, col_num, column_widths.get(col_name, 14))
+
+                mongo_col = df.columns.get_loc("Check MongoDB")
+                last_row = len(df)
+                worksheet.conditional_format(1, mongo_col, last_row, mongo_col, {
+                    'type': 'cell',
+                    'criteria': '==',
+                    'value': '"KO"',
+                    'format': ko_format
+                })
+                worksheet.conditional_format(1, mongo_col, last_row, mongo_col, {
+                    'type': 'cell',
+                    'criteria': '!=',
+                    'value': '"KO"',
+                    'format': ok_format
+                })
+
+                worksheet.autofilter(0, 0, last_row, len(df.columns) - 1)
+                worksheet.freeze_panes(1, 0)
+
+                summary_data = {
+                    "Metrica": ["Totale Dispositivi", "Con dato MongoDB",
+                                "Nessun dato (KO)", "Data Test"],
+                    "Valore": [
+                        len(rows),
+                        sum(1 for r in rows if r.get("Check MongoDB") and r["Check MongoDB"] != "KO"),
+                        sum(1 for r in rows if r.get("Check MongoDB") == "KO"),
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    ]
+                }
+                df_summary = pd.DataFrame(summary_data)
+                df_summary.to_excel(writer, index=False, sheet_name='Riepilogo')
+
+                ws_summary = writer.sheets['Riepilogo']
+                for col_num, value in enumerate(df_summary.columns.values):
+                    ws_summary.write(0, col_num, value, header_format)
+                ws_summary.set_column(0, 0, 25)
+                ws_summary.set_column(1, 1, 22)
+
+            return True, str(output_path)
+
+        except Exception as e:
+            return False, f"Errore esportazione: {str(e)}"
+
 
 def update_monitoring_file(source_path: str, dest_dir: Optional[str] = None) -> tuple[bool, str]:
     """Aggiorna il file di monitoraggio."""

@@ -1037,17 +1037,26 @@ class MainWindow(QMainWindow):
         action_layout.addWidget(action_label)
         
         action_btn_layout = QHBoxLayout()
-        
+
         self.start_btn = QPushButton("▶ Avvia Test")
         self.start_btn.clicked.connect(self.start_test)
         action_btn_layout.addWidget(self.start_btn)
-        
+
         self.stop_btn = QPushButton("■ Stop")
         self.stop_btn.setObjectName("stopButton")
         self.stop_btn.clicked.connect(self.stop_test)
         self.stop_btn.setEnabled(False)
         action_btn_layout.addWidget(self.stop_btn)
-        
+
+        self.first_arrival_btn = QPushButton("🔍 L.S. MongoDB")
+        self.first_arrival_btn.setObjectName("secondaryButton")
+        self.first_arrival_btn.setToolTip(
+            "Verifica se i dispositivi hanno mai inviato dati a MongoDB "
+            "(nessun limite temporale)"
+        )
+        self.first_arrival_btn.clicked.connect(self.open_first_arrival_dialog)
+        action_btn_layout.addWidget(self.first_arrival_btn)
+
         action_layout.addLayout(action_btn_layout)
         options_layout.addLayout(action_layout, stretch=1)
         
@@ -1680,6 +1689,20 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Errore Esportazione", result)
                 self.log(result, "ERROR")
     
+    def open_first_arrival_dialog(self):
+        """Apre la dialog dedicata al check 'Primo dato MongoDB'."""
+        try:
+            from first_arrival_dialog import FirstArrivalDialog
+        except ImportError as e:
+            QMessageBox.critical(
+                self, "Errore",
+                f"Modulo first_arrival_dialog non disponibile:\n{e}"
+            )
+            return
+
+        dialog = FirstArrivalDialog(self.data_loader, self.result_exporter, parent=self)
+        dialog.exec_()
+
     def closeEvent(self, event):
         """Gestisce la chiusura dell'applicazione"""
         if self.worker_thread and self.worker_thread.isRunning():
